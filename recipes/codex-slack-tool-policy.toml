@@ -1,0 +1,88 @@
+# WakeWire's default-deny policy for the bundled Slack app connector.
+# Merge this fragment into ~/.codex/config.toml. New Slack tools remain disabled
+# until they are explicitly reviewed and added here.
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d"]
+default_tools_enabled = false
+destructive_enabled = false
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_add_reaction"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_complete_file_upload"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_create_canvas"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_create_conversation"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_create_reminder"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_get_file_upload_url"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_get_reactions"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_invite_to_conversation"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_join_conversation"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_list_channel_members"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_list_starred_items"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_list_user_conversations"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_list_user_groups"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_list_workspaces"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_read_canvas"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_read_channel"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_read_file"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_read_thread"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_read_user_profile"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_schedule_message"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_search_channels"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_search_emojis"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_search_public"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_search_public_and_private"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_search_users"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_send_message"]
+enabled = true
+
+[apps."asdk_app_69a1d78e929881919bba0dbda1f6436d".tools."slack.slack_send_message_draft"]
+enabled = true

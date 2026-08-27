@@ -1,0 +1,1826 @@
+import { createHash } from "node:crypto";
+import path from "node:path";
+import type { WakeEvent } from "../core/event.js";
+import type { Logger } from "../logging.js";
+import type { Person } from "../people/schema.js";
+import type { PeopleStore } from "../people/store.js";
+import type { AgentAdapter } from "../sinks/types.js";
+import { BusyError, PermanentError } from "../sinks/types.js";
+import { isPrivilegedLinearAgentSessionEvent } from "../sources/linear/agent-session.js";
+import { isPrivilegedLinearUserEvent } from "../sources/linear/user-event.js";
+import { isAuthenticatedSlackHumanMessage } from "../sources/slack/normalize.js";
+import { buildAckSpec, InvalidAckEventError, UnsupportedAckEventError } from "./ack.js";
+import {
+  type CanonicalConversation,
+  type CorrelationInput,
+  correlateConversation,
+  type ResolvedLinearIssue,
+  UnresolvedLinearReferenceError,
+} from "./correlation.js";
+import {
+  DEFAULT_EXECUTION_PROFILE,
+  type ExecutionProfile,
+  type ExecutionReasoningEffort,
+  parseExecutionProfile,
+} from "./execution-profile.js";
+import { buildHermesSessionOptions, hermesTargetFromEvent } from "./hermes-identity.js";
+import {
+  decideHermesSessionReuse,
+  type HermesReuseDecision,
+  type HermesSessionLookup,
+  type HermesWorkRef,
+  workRefFromTarget,
+  workRefIsEmpty,
+} from "./hermes-session-reuse.js";
+import type { LinearIssueDirectory } from "./linear-directory.js";
+import { ParentReportFence } from "./parent-report-fence.js";
+import {
+  chipDispatchDenied,
+  type EffectivePolicy,
+  effectivePolicy,
+  PolicyConfigurationError,
+} from "./policy.js";
+import {
+  extractLinearReferences,
+  githubItemUrlsInText,
+  normalizeEmailSubject,
+  primaryLinearIdentifierForGithubPr,
+  uniqueLinearIdentifiers,
+} from "./references.js";
+import {
+  buildFinalReplySpec,
+  buildGithubReviewProgressReplySpec,
+  InvalidSourceReplyEventError,
+  UnsupportedSourceReplyEventError,
+} from "./reply.js";
+import {
+  buildSafetyWrappedPrompt,
+  buildSeparateTaskPrompts,
+  PlaceholderLocalSafetyScreener,
+  type SafetyAssessment,
+  SafetyAssessmentSchema,
+  type SafetyScreener,
+  type SafetyScreenInput,
+  type SafetyWrappedPromptInput,
+} from "./safety.js";
+import {
+  InvalidSnapBranchError,
+  resolveSnapWorkspace,
+  SNAP_ROOT,
+  SnapWorkspaceCommandError,
+  type SnapWorkspaceResolverOptions,
+  SnapWorkspaceValidationError,
+} from "./snap-workspace.js";
+import {
+  type AgentRequest,
+  type AgentRequestStore,
+  SourceReplyConflictError,
+  type WorkItem,
+  WorkItemConflictError,
+  type WorkItemKind,
+  type WorkItemStore,
+} from "./store.js";
+import {
+  type ChipIdentityConfig,
+  DEFAULT_CHIP_IDENTITIES,
+  exactPingPongReply,
+  isChipAddressed,
+  isChipMaintainedPrFeedback,
+  isChipPrincipal,
+  requestText,
+} from "./targeting.js";
+import { buildWorkItemTitle } from "./thread-title.js";
+
+class RequestAuthorizationError extends Error {}
+
+export const PROGRESS_ACK_DELAY_MS = 10_000;
+export const MAINTAINED_PR_FEEDBACK_DEBOUNCE_MS = 30_000;
+
+export interface AgentCoordinatorOptions {
+  now?: (() => Date) | undefined;
+  progressAckDelayMs?: number | undefined;
+  /** Sink adapter name (`hermes` skips the Desktop owner-only gate). */
+  sinkAdapterName?: string | undefined;
+}
+
+export interface AgentAcceptance {
+  addressed: boolean;
+  accepted: boolean;
+  duplicate?: boolean;
+  requestId?: string;
+  reason?: string;
+}
+
+/**
+ * Synchronous ingress gate. It performs only local checks and durable SQLite
+ * writes before the provider transport is acknowledged.
+ */
+export class AgentCoordinator {
+  private readonly now: () => Date;
+  private readonly progressAckDelayMs: number;
+  private readonly sinkAdapterName: string | undefined;
+
+  constructor(
+    private readonly people: PeopleStore,
+    private readonly workItems: WorkItemStore,
+    private readonly requests: AgentRequestStore,
+    private readonly chip: ChipIdentityConfig = DEFAULT_CHIP_IDENTITIES,
+    options: AgentCoordinatorOptions = {},
+  ) {
+    this.now = options.now ?? (() => new Date());
+    this.progressAckDelayMs = options.progressAckDelayMs ?? PROGRESS_ACK_DELAY_MS;
+    this.sinkAdapterName = options.sinkAdapterName;
+    if (!Number.isSafeInteger(this.progressAckDelayMs) || this.progressAckDelayMs < 0) {
+      throw new TypeError("progressAckDelayMs must be a non-negative safe integer");
+    }
+  }
+
+  accept(event: WakeEvent): AgentAcceptance {
+    return this.acceptAddressed(event, isChipAddressed(event, this.chip));
+  }
+
+  /**
+   * Accept an anchored, dispatcher-owned Codex/GPT override from Slack. This
+   * skips only the repeat @Chip mention required in channel threads; provider
+   * authentication, principal enrollment, policy, reply target, and dedup are
+   * all checked by the same ordinary Codex path below.
+   */
+  acceptSlackDispatcherOverride(event: WakeEvent): AgentAcceptance {
+    return this.acceptAddressed(event, isAuthenticatedSlackHumanMessage(event));
+  }
+
+  private acceptAddressed(event: WakeEvent, addressed: boolean): AgentAcceptance {
+    if (!addressed) return { addressed: false, accepted: false };
+    if (isChipPrincipal(event, this.chip)) {
+      return { addressed: true, accepted: false, reason: "self-event" };
+    }
+    if (event.source === "gmail" && !stringPayload(event, "rfcMessageId")) {
+      return {
+        addressed: true,
+        accepted: false,
+        reason: "Gmail addressed request requires payload.rfcMessageId",
+      };
+    }
+    const person = this.resolvePerson(event);
+    if (!person) return { addressed: true, accepted: false, reason: "principal-not-enrolled" };
+    const policy = effectivePolicy(this.people, person.id);
+    const denied = chipDispatchDenied(policy, this.sinkAdapterName);
+    if (denied) {
+      return { addressed: true, accepted: false, reason: denied };
+    }
+    const text = requestText(event);
+    const executionProfile = enforceGithubPrReviewEffort(event, parseExecutionProfile(text));
+    const maintainedPrFeedback = isChipMaintainedPrFeedback(event, this.chip);
+    const acceptedAt = this.now();
+    let ackSpec: ReturnType<typeof buildAckSpec>;
+    try {
+      // Validate and freeze the exact provider response target before accept.
+      // Supported reactions remain dormant until the ten-second deadline.
+      ackSpec = buildAckSpec(event, person.nickname);
+    } catch (error) {
+      if (error instanceof InvalidAckEventError || error instanceof UnsupportedAckEventError) {
+        return { addressed: true, accepted: false, reason: error.message };
+      }
+      throw error;
+    }
+    let item: WorkItem;
+    try {
+      item = this.provisionalWorkItem(event, person);
+    } catch (error) {
+      return {
+        addressed: true,
+        accepted: false,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+    const deferAck = isLinearStopRequest(event);
+    const delayedProgressAck = !deferAck && supportsProgressAck(event);
+    const progressAckNotBefore = delayedProgressAck
+      ? new Date(acceptedAt.getTime() + this.progressAckDelayMs).toISOString()
+      : undefined;
+    const requestNotBefore = maintainedPrFeedback
+      ? new Date(acceptedAt.getTime() + MAINTAINED_PR_FEEDBACK_DEBOUNCE_MS).toISOString()
+      : undefined;
+    const accepted = this.requests.accept({
+      sourceId: event.sourceId ?? `${event.source}:default`,
+      event,
+      personId: person.id,
+      workItemId: item.id,
+      requestText: text,
+      executionProfile,
+      dedup: requestDedupKey(event),
+      ...(maintainedPrFeedback
+        ? {
+            coalesceKey: maintainedPrFeedbackKey(event),
+            requestNotBefore,
+          }
+        : {}),
+      ...(deferAck
+        ? { ack: ackSpec, deferAck: true }
+        : delayedProgressAck
+          ? { ack: ackSpec, ackNotBefore: progressAckNotBefore }
+          : {}),
+    });
+    return {
+      addressed: true,
+      accepted: true,
+      duplicate: accepted.duplicate,
+      requestId: accepted.request.id,
+    };
+  }
+
+  private resolvePerson(event: WakeEvent): Person | null {
+    const principal = event.principal;
+    if (!principal) return null;
+    if (event.source === "gmail") {
+      // An arbitrary From header is not authorization. Gmail must report a
+      // passing aligned DMARC result before an enrolled email alias is used.
+      if (event.payload.authenticated !== true || !principal.email) return null;
+      return this.people.resolveEmail(principal.email);
+    }
+    return (
+      this.people.resolveIdentity(principal.provider, principal.tenantId, principal.subjectId)
+        ?.person ?? null
+    );
+  }
+
+  private provisionalWorkItem(event: WakeEvent, person: Person): WorkItem {
+    const aliases = correlationAliases(event, person.id);
+    const matches = new Map<string, WorkItem>();
+    for (const alias of aliases) {
+      const item = this.workItems.findByAlias("correlation", alias.kind, alias.key);
+      if (item) matches.set(item.id, item);
+    }
+    if (matches.size > 1) {
+      throw new WorkItemConflictError("source aliases point at different work items");
+    }
+    let item = matches.values().next().value;
+    if (!item) {
+      const nativeLinear = linearIssueFromEvent(event);
+      const first = nativeLinear
+        ? {
+            kind: "linear" as const,
+            key: linearKey(nativeLinear),
+            title: nativeLinear.identifier,
+          }
+        : aliases[0];
+      if (!first) throw new Error("event has no stable conversation identity");
+      item = this.workItems.getOrCreate({
+        kind: workItemKind(first.kind),
+        key: first.key,
+        title: buildWorkItemTitle(event, person, nativeLinear),
+      });
+    }
+    for (const alias of aliases) bindAlias(this.workItems, item.id, alias);
+    return item;
+  }
+}
+
+export interface GithubReviewStatus {
+  summary: string;
+  url?: string | undefined;
+}
+
+export interface AgentDispatchWorkerOptions {
+  tickMs?: number;
+  /** Maximum number of unrelated work items submitted concurrently. */
+  maxConcurrentRequests?: number;
+  now?: () => Date;
+  safetyScreener?: SafetyScreener;
+  parentReportFence?: ParentReportFence;
+  resolveWorkspace?: (
+    branch: string,
+    options?: Pick<SnapWorkspaceResolverOptions, "signal" | "mode">,
+  ) => ReturnType<typeof resolveSnapWorkspace>;
+  onReplyQueued?: (() => void) | undefined;
+  /**
+   * Path D: find an existing Hermes session for this GitHub PR / Linear ticket.
+   * Tests inject a stub. Production reads ~/.hermes/state.db + process list.
+   */
+  hermesSessionLookup?: (ref: HermesWorkRef) => HermesSessionLookup;
+  /** Reads the existing Chip status comment for duplicate GitHub rereview requests. */
+  reviewStatusLookup?: (
+    event: WakeEvent,
+    signal?: AbortSignal | undefined,
+  ) => Promise<GithubReviewStatus | null>;
+  /** Creates the Chip pickup status comment if it is missing. */
+  reviewStatusEnsure?: (
+    event: WakeEvent,
+    signal?: AbortSignal | undefined,
+  ) => Promise<GithubReviewStatus | null>;
+  /** Verifies that a formal review request produced a GitHub review or status artifact. */
+  reviewArtifactLookup?: (
+    event: WakeEvent,
+    since: string,
+    signal?: AbortSignal | undefined,
+  ) => Promise<boolean>;
+}
+
+/** Correlates, provisions, and submits accepted requests independently of acknowledgments. */
+export class AgentDispatchWorker {
+  private readonly tickMs: number;
+  private readonly maxConcurrentRequests: number;
+  private readonly now: () => Date;
+  private readonly safetyScreener: SafetyScreener;
+  private readonly workspaceResolver: NonNullable<AgentDispatchWorkerOptions["resolveWorkspace"]>;
+  private readonly parentReportFence: ParentReportFence;
+  private readonly onReplyQueued: () => void;
+  private readonly hermesSessionLookup: (ref: HermesWorkRef) => HermesSessionLookup;
+  private readonly reviewStatusLookup: NonNullable<
+    AgentDispatchWorkerOptions["reviewStatusLookup"]
+  >;
+  private readonly reviewStatusEnsure: NonNullable<
+    AgentDispatchWorkerOptions["reviewStatusEnsure"]
+  >;
+  private readonly reviewArtifactLookup: NonNullable<
+    AgentDispatchWorkerOptions["reviewArtifactLookup"]
+  >;
+  private readonly activeWorkItems = new Set<string>();
+  private readonly activeRequests = new Map<string, Promise<void>>();
+  private readonly activeAbortControllers = new Map<string, AbortController>();
+  private readonly canonicalWorkItemLocks = new Map<string, Promise<void>>();
+  private timer: NodeJS.Timeout | null = null;
+  private ticking = false;
+  private stopTicking = false;
+  private stopping = false;
+
+  constructor(
+    private readonly people: PeopleStore,
+    private readonly workItems: WorkItemStore,
+    private readonly requests: AgentRequestStore,
+    private readonly directory: LinearIssueDirectory,
+    private readonly adapter: AgentAdapter,
+    private readonly logger: Logger,
+    options: AgentDispatchWorkerOptions = {},
+  ) {
+    this.tickMs = options.tickMs ?? 250;
+    this.maxConcurrentRequests = options.maxConcurrentRequests ?? 4;
+    if (!Number.isSafeInteger(this.maxConcurrentRequests) || this.maxConcurrentRequests < 1) {
+      throw new Error("maxConcurrentRequests must be a positive safe integer");
+    }
+    this.now = options.now ?? (() => new Date());
+    this.safetyScreener = options.safetyScreener ?? new PlaceholderLocalSafetyScreener();
+    this.workspaceResolver = options.resolveWorkspace ?? resolveSnapWorkspace;
+    this.parentReportFence = options.parentReportFence ?? new ParentReportFence();
+    this.onReplyQueued = options.onReplyQueued ?? (() => {});
+    this.hermesSessionLookup =
+      options.hermesSessionLookup ??
+      (() => ({ hits: [], runningIds: new Set(), cmdlineBusy: false }));
+    this.reviewStatusLookup = options.reviewStatusLookup ?? (async () => null);
+    this.reviewStatusEnsure = options.reviewStatusEnsure ?? (async () => null);
+    this.reviewArtifactLookup = options.reviewArtifactLookup ?? (async () => false);
+  }
+
+  start(): number {
+    if (this.timer) return 0;
+    this.stopping = false;
+    const recovered = this.requests.resetInFlight();
+    this.timer = setInterval(() => void this.tick(), this.tickMs);
+    this.timer.unref?.();
+    return recovered;
+  }
+
+  async stop(): Promise<void> {
+    this.stopping = true;
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    for (const controller of this.activeAbortControllers.values()) controller.abort();
+    await Promise.allSettled([...this.activeRequests.values()]);
+  }
+
+  wake(): void {
+    if (this.stopping) return;
+    // Stop signals have an independent lane so an unrelated slow workspace or
+    // Desktop delivery cannot keep a user's halt request behind the main loop.
+    void this.tickStops();
+    void this.tick();
+  }
+
+  async tick(): Promise<void> {
+    if (this.stopping) return;
+    await this.tickStops();
+    if (this.ticking) return;
+    this.ticking = true;
+    const launched: Array<Promise<void>> = [];
+    try {
+      const ready = this.requests.listReady(this.now().toISOString());
+      const claimedWorkItems = new Set<string>();
+      for (const request of ready) {
+        if (isLinearStopRequest(request.event)) continue;
+        const current = this.requests.get(request.id);
+        if (!current || (current.status !== "acknowledged" && current.status !== "held")) {
+          continue;
+        }
+        if (
+          this.activeWorkItems.has(current.workItemId) &&
+          isGithubReviewStartRequest(current.event)
+        ) {
+          launched.push(this.launchReviewAlreadyRunning(current));
+        }
+      }
+
+      const available = this.maxConcurrentRequests - this.activeWorkItems.size;
+      let normalLaunched = 0;
+      if (available > 0) {
+        for (const request of ready) {
+          if (isLinearStopRequest(request.event)) continue;
+          const current = this.requests.get(request.id);
+          if (!current || (current.status !== "acknowledged" && current.status !== "held")) {
+            continue;
+          }
+          if (
+            this.activeWorkItems.has(request.workItemId) ||
+            claimedWorkItems.has(request.workItemId)
+          ) {
+            continue;
+          }
+          claimedWorkItems.add(request.workItemId);
+          launched.push(this.launch(current, true));
+          normalLaunched++;
+          if (normalLaunched >= available) break;
+        }
+      }
+    } finally {
+      // Release before awaiting process() so a later accept can launch another
+      // work item. Holding this lock across a Hermes turn serialized all Chip
+      // work (ENG-4673 H1 list sat behind ENG-4586 for 20+ minutes).
+      this.ticking = false;
+    }
+    await Promise.all(launched);
+  }
+
+  private async tickStops(): Promise<void> {
+    if (this.stopping || this.stopTicking) return;
+    this.stopTicking = true;
+    const launched: Array<Promise<void>> = [];
+    try {
+      const ready = this.requests
+        .listReady(this.now().toISOString())
+        .filter((request) => isLinearStopRequest(request.event));
+      for (const request of ready) {
+        const current = this.requests.get(request.id);
+        if (!current || (current.status !== "acknowledged" && current.status !== "held")) {
+          continue;
+        }
+        launched.push(this.launch(current, false));
+      }
+    } finally {
+      this.stopTicking = false;
+    }
+    await Promise.all(launched);
+  }
+
+  private launch(request: AgentRequest, serializeWorkItem: boolean): Promise<void> {
+    const existing = this.activeRequests.get(request.id);
+    if (existing) return existing;
+    if (serializeWorkItem) this.activeWorkItems.add(request.workItemId);
+    const controller = new AbortController();
+    this.activeAbortControllers.set(request.id, controller);
+    const operation = this.process(request, controller.signal).finally(() => {
+      this.activeRequests.delete(request.id);
+      this.activeAbortControllers.delete(request.id);
+      if (serializeWorkItem) this.activeWorkItems.delete(request.workItemId);
+    });
+    this.activeRequests.set(request.id, operation);
+    return operation;
+  }
+
+  private launchReviewAlreadyRunning(request: AgentRequest): Promise<void> {
+    const existing = this.activeRequests.get(request.id);
+    if (existing) return existing;
+    const controller = new AbortController();
+    this.activeAbortControllers.set(request.id, controller);
+    const operation = this.processReviewAlreadyRunning(request, controller.signal).finally(() => {
+      this.activeRequests.delete(request.id);
+      this.activeAbortControllers.delete(request.id);
+    });
+    this.activeRequests.set(request.id, operation);
+    return operation;
+  }
+
+  private async stageReviewAlreadyRunning(
+    request: AgentRequest,
+    item: WorkItem,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const status =
+      (await this.reviewStatusEnsure(request.event, signal).catch(() => null)) ??
+      (await this.reviewStatusLookup(request.event, signal).catch(() => null));
+    signal.throwIfAborted();
+    const summary = status?.summary.trim() || "review in progress";
+    const url = status?.url?.trim() || githubPullRequestUrl(request.event);
+    const sender = stringPayload(request.event, "senderLogin");
+    const text = `${sender ? `@${sender} ` : ""}I’m already reviewing this PR. Current status: ${summary}${url ? `\n\n${url}` : ""}`;
+    const spec = buildGithubReviewProgressReplySpec(request.event, text);
+    this.requests.stageImmediateFinalReply({
+      requestId: request.id,
+      codexThreadId: item.codexThreadId || `review-in-progress-${request.id}`,
+      spec,
+    });
+    this.onReplyQueued();
+    this.logger.info(
+      { request: request.id, workItem: item.id, session: item.codexThreadId },
+      "reported already-running GitHub review",
+    );
+  }
+
+  private async processReviewAlreadyRunning(
+    request: AgentRequest,
+    signal: AbortSignal,
+  ): Promise<void> {
+    this.requests.setStatus(request.id, "dispatching");
+    try {
+      signal.throwIfAborted();
+      const item = this.workItems.get(request.workItemId);
+      if (!item) throw new Error(`work item ${request.workItemId} disappeared`);
+      await this.stageReviewAlreadyRunning(request, item, signal);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.requests.setStatus(request.id, "failed", message);
+      this.logger.warn({ request: request.id, err: message }, "review progress reply failed");
+    }
+  }
+
+  private async process(request: AgentRequest, signal: AbortSignal): Promise<void> {
+    this.requests.setStatus(request.id, "dispatching");
+    try {
+      signal.throwIfAborted();
+      const person = this.people.get(request.personId);
+      if (!person?.enabled) {
+        throw new RequestAuthorizationError("person is no longer authorized");
+      }
+      const policy = effectivePolicy(this.people, person.id);
+      const denied = chipDispatchDenied(policy, this.adapter.name);
+      if (denied === "policy-denied") {
+        throw new RequestAuthorizationError("person is no longer authorized for Codex Desktop");
+      }
+      if (denied) {
+        throw new RequestAuthorizationError(
+          "person's role cannot be enforced by the Codex Desktop adapter",
+        );
+      }
+      if (!policy) {
+        throw new RequestAuthorizationError("person is no longer authorized");
+      }
+      if (isLinearStopRequest(request.event)) {
+        await this.processStop(request, signal);
+        return;
+      }
+      const correlation = await this.correlate(request, person);
+      signal.throwIfAborted();
+      let item = this.workItems.get(request.workItemId);
+      if (!item) throw new Error(`work item ${request.workItemId} disappeared`);
+      if (correlation.canonical.kind === "linear") {
+        item = this.workItems.promoteToLinear(
+          item.id,
+          correlation.canonical.key,
+          correlation.linearIssue
+            ? buildWorkItemTitle(request.event, person, correlation.linearIssue)
+            : item.title,
+        );
+      }
+      for (const key of correlation.aliases) {
+        bindAlias(this.workItems, item.id, aliasFromKey(key));
+      }
+      await this.withCanonicalWorkItemLock(item.id, () =>
+        this.dispatchCorrelatedRequest(
+          request,
+          person,
+          policy,
+          correlation.linearIssue,
+          item.id,
+          signal,
+        ),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const current = this.requests.get(request.id);
+      if (
+        current?.status === "failed" &&
+        current.error === "superseded by a later authenticated stop request"
+      ) {
+        return;
+      }
+      if (signal.aborted) {
+        if (current?.status === "dispatching") {
+          this.requests.setStatus(request.id, "acknowledged");
+        }
+        return;
+      }
+      const workspaceFailure = isTerminalWorkspaceFailure(error);
+      if (
+        error instanceof RequestAuthorizationError ||
+        error instanceof PolicyConfigurationError ||
+        error instanceof PermanentError ||
+        error instanceof SourceReplyConflictError ||
+        error instanceof WorkItemConflictError ||
+        workspaceFailure
+      ) {
+        if (isLinearStopRequest(request.event)) {
+          const ack = this.requests.ackForRequest(request.id);
+          if (ack?.status !== "held") {
+            throw new Error(`authenticated stop ${request.id} is missing its held acknowledgment`);
+          }
+          this.requests.finalizeDeferredRequest({
+            requestId: request.id,
+            status: "failed",
+            error: message,
+            payload: {
+              ...ack.payload,
+              text: "I couldn't confirm that the Codex Desktop task stopped.",
+              contentType: "error",
+              ephemeral: false,
+            },
+          });
+        } else if (workspaceFailure) {
+          try {
+            const spec = buildFinalReplySpec(
+              request.event,
+              workspacePreparationFailureReply(request.id),
+            );
+            this.requests.stageTerminalFailureReply({
+              requestId: request.id,
+              error: message,
+              spec,
+            });
+            this.onReplyQueued();
+          } catch (replyError) {
+            if (
+              replyError instanceof UnsupportedSourceReplyEventError ||
+              replyError instanceof InvalidSourceReplyEventError
+            ) {
+              this.requests.setStatus(request.id, "failed", message);
+              this.logger.warn(
+                {
+                  request: request.id,
+                  err: replyError.message,
+                  provider: request.event.source,
+                },
+                "workspace failure has no valid provider reply target",
+              );
+            } else {
+              throw replyError;
+            }
+          }
+        } else {
+          this.requests.setStatus(request.id, "failed", message);
+        }
+        this.logger.warn(
+          {
+            request: request.id,
+            err: message,
+            ...(error instanceof SnapWorkspaceCommandError
+              ? {
+                  workspaceCommand: {
+                    code: error.diagnostics.code,
+                    signal: error.diagnostics.signal,
+                  },
+                }
+              : {}),
+          },
+          "request failed permanently",
+        );
+        return;
+      }
+      const delay = Math.min(60_000, 1_000 * 2 ** Math.min(request.attemptCount, 6));
+      this.requests.hold(request.id, message, new Date(this.now().getTime() + delay).toISOString());
+      this.logger.warn({ request: request.id, err: message, retryInMs: delay }, "request held");
+    }
+  }
+
+  private async dispatchCorrelatedRequest(
+    request: AgentRequest,
+    person: Person,
+    policy: EffectivePolicy,
+    linearIssue: ResolvedLinearIssue | undefined,
+    workItemId: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    signal.throwIfAborted();
+    let item = this.workItems.get(workItemId);
+    if (!item) throw new Error(`work item ${workItemId} disappeared after correlation`);
+    if (this.requests.hasLaterStop(request.id, item.id)) {
+      this.requests.supersedeRequest(
+        request.id,
+        "superseded by a later authenticated stop request",
+      );
+      this.logger.info(
+        { request: request.id, workItem: item.id },
+        "request superseded before Codex Desktop submission",
+      );
+      return;
+    }
+    if (request.event.kind === "pull_request.review_requested") {
+      await this.reviewStatusEnsure(request.event, signal).catch((error) => {
+        this.logger.warn(
+          {
+            request: request.id,
+            err: error instanceof Error ? error.message : String(error),
+          },
+          "could not ensure Chip review status comment",
+        );
+        return null;
+      });
+    }
+    const screenInput: SafetyScreenInput = {
+      principal: {
+        id: person.id,
+        nickname: person.nickname,
+        roleName: person.roleName,
+      },
+      source: request.event.source,
+      sourceDeliveryId: request.sourceDeliveryId,
+      canonicalWorkItem: item.canonicalKey,
+      requestText: request.requestText,
+      providerContext: {
+        summary: request.event.summary,
+        payload: request.event.payload,
+      },
+    };
+    const assessment = SafetyAssessmentSchema.parse(
+      await this.safetyScreener.screen(screenInput, { signal }),
+    );
+    signal.throwIfAborted();
+    this.logger.info(
+      {
+        request: request.id,
+        safetyPolicyVersion: assessment.policyVersion,
+        safetyScreenMode: assessment.mode,
+        safetyScreenEnforcing: assessment.enforcing,
+        safetyDecision: assessment.decision,
+        safetyReasonCodes: assessment.reasonCodes,
+      },
+      "safety screen completed",
+    );
+    if (assessment.decision === "deny") {
+      throw new PermanentError(
+        `safety screen denied request (${assessment.reasonCodes.join(", ") || "no reason"})`,
+      );
+    }
+    if (assessment.decision === "hold") {
+      throw new Error(
+        `safety screen held request (${assessment.reasonCodes.join(", ") || "no reason"})`,
+      );
+    }
+    const reuse = this.hermesReuseDecision(request, item, linearIssue);
+    if (reuse?.action === "ignore") {
+      await this.stageReviewAlreadyRunning(request, item, signal);
+      return;
+    }
+    if (reuse?.action === "hold") {
+      throw new BusyError(`hermes session ${reuse.sessionId} in flight`);
+    }
+    const resumeId = reuse?.action === "resume" ? reuse.sessionId : item.codexThreadId;
+    const existingOrchestration = this.requests.orchestrationForRequest(request.id);
+    const cwd = existingOrchestration
+      ? existingOrchestration.cwd
+      : resumeId
+        ? trustedResumeCwd(item.cwd)
+        : await this.resolveCwd(linearIssue, item, request.event, signal);
+    signal.throwIfAborted();
+    if (!existingOrchestration) this.workItems.setWorkspace(item.id, cwd);
+    item = this.workItems.get(item.id) ?? item;
+    if (this.requests.hasLaterStop(request.id, item.id)) {
+      this.requests.supersedeRequest(
+        request.id,
+        "superseded by a later authenticated stop request",
+      );
+      return;
+    }
+    const executionProfile = enforceGithubPrReviewEffort(request.event, request.executionProfile);
+    const dispatchRequest =
+      executionProfile === request.executionProfile ? request : { ...request, executionProfile };
+    const execution = executionPlan(
+      executionProfile,
+      this.adapter.name === "codex-desktop" && !item.codexThreadId,
+      item.title,
+      Boolean(existingOrchestration),
+    );
+    const promptInput = authenticatedPromptInput(
+      dispatchRequest,
+      person,
+      item,
+      policy,
+      assessment,
+      execution,
+    );
+    if (execution.delegateToSeparateTask) {
+      await this.dispatchSeparateRequest(dispatchRequest, item, promptInput, cwd, policy, signal);
+      return;
+    }
+    // Deterministic health check — never send ping through the agent (avoids
+    // chatty model preambles like "Path D is up…").
+    const pong = exactPingPongReply(request.requestText);
+    if (pong !== null) {
+      // Reply staging needs a thread id; never bind ping-* placeholders as the
+      // WorkItem Hermes/Codex session (first non-ping turn owns the real bind).
+      const threadId = item.codexThreadId ?? `ping-${request.id}`;
+      try {
+        const spec = buildFinalReplySpec(request.event, pong);
+        this.requests.stageImmediateFinalReply({
+          requestId: request.id,
+          codexThreadId: threadId,
+          spec,
+        });
+        this.onReplyQueued();
+        this.logger.info(
+          { request: request.id, provider: request.event.source, threadId },
+          "answered ping with deterministic pong",
+        );
+      } catch (error) {
+        if (error instanceof UnsupportedSourceReplyEventError) {
+          this.requests.finalizeImmediateCompletion({
+            requestId: request.id,
+            codexThreadId: threadId,
+            status: "completed",
+          });
+        } else if (error instanceof InvalidSourceReplyEventError) {
+          this.requests.finalizeImmediateCompletion({
+            requestId: request.id,
+            codexThreadId: threadId,
+            status: "failed",
+            error: `cannot queue ping reply: ${error.message}`,
+          });
+        } else {
+          throw error;
+        }
+      }
+      return;
+    }
+    const prompt = buildSafetyWrappedPrompt(promptInput);
+    const options = {
+      sandbox: sandboxForPolicy(policy),
+      cwd,
+      model: execution.currentModel,
+      reasoningEffort: execution.currentReasoningEffort,
+      idempotencyKey: request.id,
+      signal,
+      ...(this.adapter.name === "hermes"
+        ? {
+            hermesSession: buildHermesSessionOptions({
+              event: request.event,
+              person,
+              workItemId: item.id,
+              workItemTitle: item.title,
+              linearIdentifier: linearIssue?.identifier,
+              linearTitle: linearIssue?.title,
+            }),
+          }
+        : {}),
+    };
+    // Bind before awaiting the turn so a host reboot can resume this session
+    // instead of minting a second review (session_key stamp is the other half).
+    if (resumeId) this.workItems.setCodexThread(item.id, resumeId);
+    const result = resumeId
+      ? await this.adapter.deliverToThread(resumeId, prompt, options)
+      : await this.adapter.startThread(prompt, options);
+    this.workItems.setCodexThread(item.id, result.threadId);
+    if (this.requests.hasLaterStop(request.id, item.id)) {
+      this.requests.supersedeRequest(
+        request.id,
+        "superseded by a later authenticated stop request",
+      );
+      this.logger.info(
+        { request: request.id, workItem: item.id, threadId: result.threadId },
+        "submitted turn awaits the authenticated stop lane",
+      );
+      return;
+    }
+    signal.throwIfAborted();
+    if (result.correlationMarker) {
+      this.requests.bindSubmittedCompletion({
+        requestId: request.id,
+        codexThreadId: result.threadId,
+        ...(result.turnId ? { codexTurnId: result.turnId } : {}),
+        correlationMarker: result.correlationMarker,
+      });
+    } else if (result.finalResponse !== undefined) {
+      const missingReviewArtifact =
+        request.event.kind === "pull_request.review_requested" &&
+        !(await this.reviewArtifactLookup(request.event, request.event.occurredAt, signal).catch(
+          () => false,
+        ));
+      if (missingReviewArtifact) {
+        this.requests.stageImmediateFinalReply({
+          requestId: request.id,
+          codexThreadId: result.threadId,
+          ...(result.turnId ? { codexTurnId: result.turnId } : {}),
+          spec: buildGithubReviewProgressReplySpec(request.event, result.finalResponse),
+        });
+        this.onReplyQueued();
+        this.logger.warn(
+          { request: request.id, threadId: result.threadId },
+          "GitHub review request returned without a review artifact; surfaced final response",
+        );
+      } else {
+        try {
+          const spec = buildFinalReplySpec(request.event, result.finalResponse);
+          this.requests.stageImmediateFinalReply({
+            requestId: request.id,
+            codexThreadId: result.threadId,
+            ...(result.turnId ? { codexTurnId: result.turnId } : {}),
+            spec,
+          });
+        } catch (error) {
+          if (error instanceof UnsupportedSourceReplyEventError) {
+            this.requests.finalizeImmediateCompletion({
+              requestId: request.id,
+              codexThreadId: result.threadId,
+              ...(result.turnId ? { codexTurnId: result.turnId } : {}),
+              status: "completed",
+            });
+            this.logger.info(
+              {
+                request: request.id,
+                provider: request.event.source,
+                threadId: result.threadId,
+                turnId: result.turnId,
+              },
+              "Codex request completed; final answer remains in Codex for this provider",
+            );
+          } else if (error instanceof InvalidSourceReplyEventError) {
+            this.requests.finalizeImmediateCompletion({
+              requestId: request.id,
+              codexThreadId: result.threadId,
+              ...(result.turnId ? { codexTurnId: result.turnId } : {}),
+              status: "failed",
+              error: `cannot queue final source reply: ${error.message}`,
+            });
+            this.logger.warn(
+              { request: request.id, err: error.message },
+              "completed Codex answer has no valid originating reply target",
+            );
+          } else {
+            throw error;
+          }
+        }
+      }
+    } else {
+      if (this.adapter.name === "codex-desktop") {
+        throw new PermanentError("Codex Desktop did not return its durable correlation marker");
+      }
+      throw new PermanentError(`${this.adapter.name} did not return a final response`);
+    }
+    await this.syncThreadTitle(item.id, result.threadId);
+    this.logger.info(
+      {
+        request: request.id,
+        workItem: item.id,
+        threadId: result.threadId,
+        turnId: result.turnId,
+        model: execution.currentModel,
+        reasoningEffort: execution.currentReasoningEffort,
+        delegatedToSeparateTask: execution.delegateToSeparateTask,
+        completionBound: Boolean(result.correlationMarker || result.finalResponse !== undefined),
+      },
+      "authorized request submitted to Codex Desktop",
+    );
+  }
+
+  private async dispatchSeparateRequest(
+    request: AgentRequest,
+    item: WorkItem,
+    promptInput: SafetyWrappedPromptInput,
+    cwd: string,
+    policy: EffectivePolicy,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (!this.adapter.prepareThread) {
+      throw new PermanentError(`${this.adapter.name} cannot host a durable separate Codex task`);
+    }
+    const prompts = buildSeparateTaskPrompts(promptInput);
+    const sandbox = sandboxForPolicy(policy);
+    let orchestration = this.requests.beginOrchestration({
+      requestId: request.id,
+      cwd,
+      sandbox,
+      childPrompt: prompts.childPrompt,
+      childTitle: promptInput.execution.childTitle ?? item.title,
+      reportPromptPrefix: prompts.reportPromptPrefix,
+      reportPromptSuffix: prompts.reportPromptSuffix,
+    });
+
+    let parentThreadId = orchestration.parentThreadId ?? item.codexThreadId;
+    if (!parentThreadId) {
+      const prepared = await this.adapter.prepareThread({
+        sandbox,
+        cwd,
+        model: promptInput.execution.currentModel,
+        reasoningEffort: promptInput.execution.currentReasoningEffort,
+        idempotencyKey: `${request.id}:parent-task`,
+        signal,
+      });
+      parentThreadId = prepared.threadId;
+    }
+    this.workItems.setCodexThread(item.id, parentThreadId);
+    orchestration = this.requests.setOrchestrationParent(request.id, parentThreadId);
+    await this.syncThreadTitle(item.id, parentThreadId);
+    signal.throwIfAborted();
+    if (this.requests.hasLaterStop(request.id, item.id)) {
+      this.requests.supersedeRequest(
+        request.id,
+        "superseded by a later authenticated stop request",
+      );
+      return;
+    }
+
+    let childThreadId = orchestration.childThreadId;
+    if (!childThreadId) {
+      const prepared = await this.adapter.prepareThread({
+        sandbox,
+        cwd,
+        model: request.executionProfile.model,
+        reasoningEffort: request.executionProfile.reasoningEffort,
+        idempotencyKey: `${request.id}:child-task`,
+        signal,
+      });
+      childThreadId = prepared.threadId;
+    }
+    orchestration = this.requests.setOrchestrationChild(request.id, childThreadId);
+    signal.throwIfAborted();
+    if (this.requests.hasLaterStop(request.id, item.id)) {
+      this.requests.supersedeRequest(
+        request.id,
+        "superseded by a later authenticated stop request",
+      );
+      return;
+    }
+
+    const result = await this.adapter.deliverToThread(childThreadId, orchestration.childPrompt, {
+      sandbox,
+      cwd,
+      model: request.executionProfile.model,
+      reasoningEffort: request.executionProfile.reasoningEffort,
+      idempotencyKey: `${request.id}:child-turn`,
+      preparedThread: true,
+      signal,
+    });
+    if (!result.correlationMarker) {
+      throw new PermanentError(
+        `${this.adapter.name} did not return a durable child correlation marker`,
+      );
+    }
+    if (this.requests.hasLaterStop(request.id, item.id)) {
+      this.requests.supersedeRequest(
+        request.id,
+        "superseded by a later authenticated stop request",
+      );
+      return;
+    }
+    signal.throwIfAborted();
+    orchestration = this.requests.bindChildSubmission({
+      requestId: request.id,
+      childThreadId,
+      ...(result.turnId ? { childTurnId: result.turnId } : {}),
+      correlationMarker: result.correlationMarker,
+    });
+    // Desktop auto-names a task when its first turn begins, so the durable
+    // child title must be asserted only after that turn is bound.
+    await this.syncChildTitle(request.id, childThreadId, orchestration.childTitle);
+    this.logger.info(
+      {
+        request: request.id,
+        workItem: item.id,
+        parentThreadId,
+        childThreadId,
+        childTurnId: result.turnId,
+        model: request.executionProfile.model,
+        reasoningEffort: request.executionProfile.reasoningEffort,
+      },
+      "authorized request submitted to a host-controlled child Codex task",
+    );
+  }
+
+  private async syncChildTitle(requestId: string, threadId: string, title: string): Promise<void> {
+    if (!this.adapter.setThreadTitle) return;
+    try {
+      await this.adapter.setThreadTitle(threadId, title);
+      if (this.adapter.readThreadTitle) {
+        const confirmedTitle = await this.adapter.readThreadTitle(threadId);
+        if (confirmedTitle !== title) {
+          throw new Error(
+            `title readback mismatch (expected ${JSON.stringify(title)}, got ${JSON.stringify(confirmedTitle)})`,
+          );
+        }
+        this.requests.confirmChildTitleSynchronized(requestId, threadId, title);
+      }
+    } catch (error) {
+      this.logger.warn(
+        {
+          request: requestId,
+          threadId,
+          title,
+          err: error instanceof Error ? error.message : String(error),
+        },
+        "child Codex task title synchronization failed; orchestration remains durable",
+      );
+    }
+  }
+
+  /**
+   * Cosmetic metadata is intentionally outside turn delivery. A failed title
+   * update remains unsynced for a later retry and can never resubmit a prompt.
+   */
+  private async syncThreadTitle(workItemId: string, threadId: string): Promise<void> {
+    const item = this.workItems.get(workItemId);
+    if (!item || item.codexThreadTitle === item.title || !this.adapter.setThreadTitle) return;
+    try {
+      // Reassert through Codex's metadata API before its own readback confirms
+      // the persisted user-facing name. Visible renderer state is separate.
+      await this.adapter.setThreadTitle(threadId, item.title);
+      if (this.adapter.readThreadTitle) {
+        const confirmedTitle = await this.adapter.readThreadTitle(threadId);
+        if (confirmedTitle !== item.title) {
+          throw new Error(
+            `title readback mismatch (expected ${JSON.stringify(item.title)}, got ${JSON.stringify(confirmedTitle)})`,
+          );
+        }
+      }
+      if (!this.workItems.confirmCodexThreadTitle(item.id, threadId, item.title)) return;
+      this.logger.info(
+        { workItem: item.id, threadId, title: item.title },
+        "Codex task title synchronized",
+      );
+    } catch (error) {
+      this.logger.warn(
+        {
+          workItem: item.id,
+          threadId,
+          err: error instanceof Error ? error.message : String(error),
+        },
+        "Codex task title synchronization failed; turn delivery remains successful",
+      );
+    }
+  }
+
+  private async withCanonicalWorkItemLock<T>(
+    workItemId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.canonicalWorkItemLocks.get(workItemId) ?? Promise.resolve();
+    let release = (): void => {};
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.canonicalWorkItemLocks.set(workItemId, current);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.canonicalWorkItemLocks.get(workItemId) === current) {
+        this.canonicalWorkItemLocks.delete(workItemId);
+      }
+    }
+  }
+
+  private async processStop(request: AgentRequest, signal: AbortSignal): Promise<void> {
+    let item = this.workItems.get(request.workItemId);
+    if (!item) throw new PermanentError(`work item ${request.workItemId} disappeared`);
+    const workItemId = item.id;
+    const superseded = this.requests.supersedePendingBeforeStop(request.id, workItemId);
+    const reportDrain = this.parentReportFence.block(superseded);
+    for (const id of superseded) this.activeAbortControllers.get(id)?.abort();
+    const interrupt = async (threadId: string): Promise<void> => {
+      if (!this.adapter.interruptThread) {
+        throw new PermanentError(
+          `${this.adapter.name} cannot enforce an authenticated stop request`,
+        );
+      }
+      await this.adapter.interruptThread(threadId);
+    };
+    const boundThreadIds = (): string[] => {
+      const ids = new Set<string>();
+      const currentItem = this.workItems.get(workItemId);
+      if (currentItem?.codexThreadId) ids.add(currentItem.codexThreadId);
+      for (const id of superseded) {
+        const orchestration = this.requests.orchestrationForRequest(id);
+        if (orchestration?.parentThreadId) ids.add(orchestration.parentThreadId);
+        if (orchestration?.childThreadId) ids.add(orchestration.childThreadId);
+      }
+      return [...ids];
+    };
+
+    // Interrupt an existing turn immediately, then wait for any older request
+    // that was already inside workspace/Desktop delivery. If that request was
+    // starting a new task, reload its persisted id and interrupt it before
+    // releasing Linear's stop confirmation.
+    for (const threadId of boundThreadIds()) await interrupt(threadId);
+    const active = superseded
+      .map((id) => this.activeRequests.get(id))
+      .filter((operation): operation is Promise<void> => Boolean(operation));
+    await Promise.allSettled([...active, reportDrain.settled]);
+    signal.throwIfAborted();
+    item = this.workItems.get(item.id) ?? item;
+    // A start-turn can race after the first interrupt. Repeat the stop after
+    // every older in-flight delivery settles; Desktop's stop is idempotent.
+    if (active.length > 0 || reportDrain.activeCount > 0) {
+      for (const threadId of boundThreadIds()) await interrupt(threadId);
+    }
+
+    this.requests.finalizeDeferredRequest({ requestId: request.id, status: "completed" });
+    this.logger.info(
+      {
+        request: request.id,
+        workItem: item.id,
+        threadIds: boundThreadIds(),
+        superseded: superseded.length,
+        drainedParentReports: reportDrain.activeCount,
+      },
+      "authenticated stop request applied",
+    );
+  }
+
+  private async correlate(request: AgentRequest, person: Person) {
+    const event = request.event;
+    const references = extractLinearReferences({
+      text: [
+        request.requestText,
+        stringPayload(event, "title"),
+        stringPayload(event, "subject"),
+        stringPayload(event, "body"),
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      urls: [
+        stringPayload(event, "url"),
+        stringPayload(event, "pullRequestUrl"),
+        stringPayload(event, "issueUrl"),
+      ].filter(Boolean),
+      branches: [stringPayload(event, "branch"), stringPayload(event, "branchName")].filter(
+        Boolean,
+      ),
+    });
+    const githubPrimary =
+      event.source === "github"
+        ? primaryLinearIdentifierForGithubPr({
+            title: stringPayload(event, "title"),
+            branch: stringPayload(event, "branch") || stringPayload(event, "branchName"),
+          })
+        : undefined;
+    const linearMatches = new Map<string, ResolvedLinearIssue>();
+    const addLinearMatch = (issue: ResolvedLinearIssue, evidence: string): void => {
+      const key = `${issue.organizationId}\0${issue.issueId}`;
+      const existing = linearMatches.get(key);
+      if (
+        existing &&
+        (existing.identifier !== issue.identifier ||
+          (existing.branchName && issue.branchName && existing.branchName !== issue.branchName))
+      ) {
+        throw new WorkItemConflictError(
+          `conflicting Linear identity for ${evidence}: ${existing.identifier} vs ${issue.identifier}`,
+        );
+      }
+      const merged: ResolvedLinearIssue = {
+        organizationId: issue.organizationId,
+        issueId: issue.issueId,
+        identifier: issue.identifier,
+      };
+      const title = issue.title ?? existing?.title;
+      if (title) merged.title = title;
+      const branchName = issue.branchName ?? existing?.branchName;
+      if (branchName) merged.branchName = branchName;
+      linearMatches.set(key, merged);
+    };
+
+    const nativeLinear = linearIssueFromEvent(event);
+    if (nativeLinear) addLinearMatch(nativeLinear, "native Linear event");
+    for (const identifier of uniqueLinearIdentifiers(references)) {
+      if (nativeLinear?.identifier === identifier) continue;
+      if (event.source === "github" && githubPrimary && identifier !== githubPrimary) continue;
+      const resolved = await this.lookupLinearIssue(identifier, event);
+      if (!resolved) {
+        if (event.source === "github") continue;
+        throw new UnresolvedLinearReferenceError(identifier);
+      }
+      addLinearMatch(resolved, identifier);
+    }
+    if (nativeLinear && !nativeLinear.branchName) {
+      const resolved = await this.lookupLinearIssue(nativeLinear.identifier, event);
+      if (resolved) addLinearMatch(resolved, nativeLinear.identifier);
+    }
+
+    const providerUrls = [
+      stringPayload(event, "pullRequestUrl"),
+      stringPayload(event, "issueUrl"),
+      stringPayload(event, "url"),
+    ].filter((url) => /^https:\/\/github\.com\//i.test(url));
+    const mentionedUrls = githubItemUrlsInText(
+      [
+        request.requestText,
+        stringPayload(event, "title"),
+        stringPayload(event, "subject"),
+        stringPayload(event, "body"),
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
+    for (const url of new Set([...providerUrls, ...mentionedUrls])) {
+      for (const issue of await this.lookupLinearIssuesForUrl(url, event)) {
+        if (event.source === "github" && githubPrimary && issue.identifier !== githubPrimary) {
+          continue;
+        }
+        addLinearMatch(issue, url);
+      }
+    }
+    if (event.source === "github" && linearMatches.size > 1) {
+      if (githubPrimary) {
+        for (const [key, issue] of [...linearMatches.entries()]) {
+          if (issue.identifier !== githubPrimary) linearMatches.delete(key);
+        }
+      } else {
+        linearMatches.clear();
+      }
+    }
+    if (linearMatches.size > 1) {
+      throw new WorkItemConflictError(
+        `message resolves to multiple Linear issues: ${[...linearMatches.values()]
+          .map((issue) => issue.identifier)
+          .sort()
+          .join(", ")}`,
+      );
+    }
+    const linear = linearMatches.values().next().value;
+    const input: CorrelationInput = {
+      ...(linear ? { linear } : {}),
+      ...correlationInputForEvent(event, person.id),
+    };
+    return correlateConversation(input, {
+      resolveLinearIdentifier: (identifier) => this.directory.resolveIdentifier(identifier),
+      findByAlias: async (aliasKey) => {
+        const alias = aliasFromKey(aliasKey);
+        const found = this.workItems.findByAlias("correlation", alias.kind, alias.key);
+        return found ? canonicalForWorkItem(found) : null;
+      },
+    });
+  }
+
+  /**
+   * GitHub review/mention must not wait on Linear OAuth or API. Ticket attach
+   * is best-effort; a reboot that loses Linear app credentials used to hold
+   * PR reviews forever (incident 2026-08-21 #1110). Linear-origin events still
+   * fail closed.
+   */
+  private async lookupLinearIssue(
+    identifier: string,
+    event: WakeEvent,
+  ): Promise<ResolvedLinearIssue | null> {
+    try {
+      return await this.directory.resolveIdentifier(identifier);
+    } catch (error) {
+      if (event.source !== "github") throw error;
+      this.logger.warn(
+        { identifier, err: error instanceof Error ? error.message : String(error) },
+        "Linear directory failed; GitHub request continues without ticket attach",
+      );
+      return null;
+    }
+  }
+
+  private async lookupLinearIssuesForUrl(
+    url: string,
+    event: WakeEvent,
+  ): Promise<ResolvedLinearIssue[]> {
+    try {
+      return await this.directory.issuesForUrl(url);
+    } catch (error) {
+      if (event.source !== "github") throw error;
+      this.logger.warn(
+        { url, err: error instanceof Error ? error.message : String(error) },
+        "Linear URL lookup failed; GitHub request continues without ticket attach",
+      );
+      return [];
+    }
+  }
+
+  private hermesReuseDecision(
+    request: AgentRequest,
+    item: WorkItem,
+    linearIssue: ResolvedLinearIssue | undefined,
+  ): HermesReuseDecision | null {
+    if (this.adapter.name !== "hermes") return null;
+    const ref = workRefFromTarget(
+      hermesTargetFromEvent(request.event, {
+        workItemId: item.id,
+        linearIdentifier: linearIssue?.identifier,
+      }),
+    );
+    if (workRefIsEmpty(ref) && !item.codexThreadId) return null;
+    let lookup: HermesSessionLookup;
+    try {
+      lookup = this.hermesSessionLookup(ref);
+    } catch {
+      lookup = { hits: [], runningIds: new Set(), cmdlineBusy: false };
+    }
+    return decideHermesSessionReuse({
+      ref,
+      boundSessionId: item.codexThreadId,
+      hits: lookup.hits,
+      runningIds: lookup.runningIds,
+      cmdlineBusy: lookup.cmdlineBusy,
+      // A fresh duplicate review request is safely ignored while its session is
+      // running. A crash/timeout retry must hold instead, then resume when the
+      // old process exits; marking that retry complete would lose the review.
+      reviewRequest: isGithubReviewStartRequest(request.event) && request.attemptCount === 0,
+    });
+  }
+
+  private async resolveCwd(
+    linear: ResolvedLinearIssue | undefined,
+    item: WorkItem,
+    event: WakeEvent,
+    signal: AbortSignal,
+  ): Promise<string> {
+    const mode = isGithubPullRequestEvent(event) ? "pull-request" : "issue";
+    if (linear) {
+      if (!linear.branchName) {
+        // Linear issue known but no Snap-valid branch (long GitHub names,
+        // underscores, missing gitBranchName). Chat/Hermes can still run at
+        // the Snap monorepo root; coding tasks that need prepare should cite
+        // an exact controller branch.
+        return SNAP_ROOT;
+      }
+      return (await this.workspaceResolver(linear.branchName, { signal, mode })).cwd;
+    }
+    if (item.canonicalKind !== "linear") return SNAP_ROOT;
+
+    // Alias reuse can select an already-promoted Linear work item without a
+    // fresh issue lookup. If the previous turn already fell back to SNAP_ROOT
+    // (no valid controller branch), keep chatting there — do not fail closed.
+    if (!item.cwd || item.cwd === SNAP_ROOT) return SNAP_ROOT;
+    if (path.dirname(item.cwd) !== SNAP_ROOT) {
+      throw new WorkItemConflictError(
+        `Linear work item ${item.canonicalKey} has no trusted Snap workspace`,
+      );
+    }
+    const branch = path.basename(item.cwd);
+    const resolved = await this.workspaceResolver(branch, { signal, mode });
+    if (resolved.cwd !== item.cwd) {
+      throw new WorkItemConflictError(
+        `Linear work item ${item.canonicalKey} changed workspace identity`,
+      );
+    }
+    return resolved.cwd;
+  }
+}
+
+function requestDedupKey(event: WakeEvent): { scope: string; deliveryId: string } | undefined {
+  if (event.source !== "gmail") return undefined;
+  const mailbox = event.principal?.tenantId.trim().toLowerCase();
+  if (!mailbox) return undefined;
+  return {
+    scope: `gmail-mailbox:${mailbox}`,
+    deliveryId: event.deliveryId,
+  };
+}
+
+interface CorrelationAlias {
+  kind: string;
+  key: string;
+}
+
+function correlationAliases(event: WakeEvent, personId: string): CorrelationAlias[] {
+  const aliases: CorrelationAlias[] = [];
+  const payload = event.payload;
+  if (event.source === "github") {
+    const repositoryId = identifier(payload.repositoryId) || stringPayload(event, "repo");
+    const number = identifier(payload.number);
+    if (repositoryId && number) {
+      const type =
+        payload.isPullRequest === true || event.kind.startsWith("pull_request")
+          ? "pull-request"
+          : "issue";
+      aliases.push({ kind: "github", key: `github:${repositoryId}:${type}:${number}` });
+    }
+  }
+  if (event.source === "slack" && event.conversation?.rootKey) {
+    aliases.push({ kind: "slack", key: `slack:${event.conversation.rootKey}` });
+  }
+  if (event.source === "gmail") {
+    const mailbox = event.principal?.tenantId.toLowerCase();
+    const root = event.conversation?.rootKey;
+    if (mailbox && root) {
+      aliases.push({
+        kind: "gmail-rfc",
+        key: `gmail-rfc:${digest(`${mailbox}\0${stripAngles(root).toLowerCase()}`)}`,
+      });
+    }
+    const subject = normalizeEmailSubject(stringPayload(event, "subject"));
+    if (mailbox && subject) {
+      aliases.push({
+        kind: "email-subject",
+        key: `email-subject:${digest(`${mailbox}\0${personId.toLowerCase()}\0${subject}`)}`,
+      });
+    }
+  }
+  const linear = linearIssueFromEvent(event);
+  if (linear) aliases.unshift({ kind: "linear", key: linearKey(linear) });
+  return deduplicate(aliases);
+}
+
+function correlationInputForEvent(event: WakeEvent, personId: string): Partial<CorrelationInput> {
+  const payload = event.payload;
+  if (event.source === "github") {
+    const repositoryId = identifier(payload.repositoryId) || stringPayload(event, "repo");
+    const itemId = identifier(payload.number);
+    return repositoryId && itemId
+      ? {
+          github: {
+            repositoryId,
+            itemId,
+            itemType:
+              payload.isPullRequest === true || event.kind.startsWith("pull_request")
+                ? "pull-request"
+                : "issue",
+          },
+        }
+      : {};
+  }
+  if (event.source === "slack") {
+    const rootKey = event.conversation?.rootKey;
+    const [teamId, channelId, rootTs] = rootKey ? rootKey.split(":") : [];
+    return teamId && channelId && rootTs ? { slack: { teamId, channelId, rootTs } } : {};
+  }
+  if (event.source === "gmail") {
+    const mailbox = event.principal?.tenantId;
+    const rfcThreadId = event.conversation?.rootKey;
+    const subject = stringPayload(event, "subject");
+    return {
+      ...(mailbox && rfcThreadId ? { gmail: { mailbox, rfcThreadId } } : {}),
+      ...(mailbox && subject ? { email: { mailbox, personId, subject } } : {}),
+    };
+  }
+  return {};
+}
+
+function linearIssueFromEvent(event: WakeEvent): ResolvedLinearIssue | undefined {
+  if (event.principal?.provider !== "linear") return undefined;
+  const organizationId = event.principal.tenantId;
+  const issueId = stringPayload(event, "issueId");
+  const identifierValue = stringPayload(event, "identifier");
+  if (!organizationId || !issueId || !identifierValue) return undefined;
+  const branchName = stringPayload(event, "branchName");
+  const title = stringPayload(event, "title");
+  return {
+    organizationId,
+    issueId,
+    identifier: identifierValue.toUpperCase(),
+    ...(title ? { title } : {}),
+    ...(branchName ? { branchName } : {}),
+  };
+}
+
+function linearKey(issue: ResolvedLinearIssue): string {
+  return `linear:${encodeURIComponent(issue.organizationId)}:${encodeURIComponent(issue.issueId)}`;
+}
+
+function isTerminalWorkspaceFailure(error: unknown): boolean {
+  return (
+    error instanceof InvalidSnapBranchError ||
+    error instanceof SnapWorkspaceCommandError ||
+    error instanceof SnapWorkspaceValidationError
+  );
+}
+
+function workspacePreparationFailureReply(requestId: string): string {
+  return (
+    "I couldn't start this request because its Snap workspace could not be prepared. " +
+    `No agent task was started. WakeWire request: ${requestId}. ` +
+    "Fix the local Snap controller environment, then send the request again."
+  );
+}
+
+function bindAlias(store: WorkItemStore, workItemId: string, alias: CorrelationAlias): void {
+  store.attachAlias(workItemId, {
+    provider: "correlation",
+    scope: alias.kind,
+    nativeKey: alias.key,
+  });
+}
+
+function aliasFromKey(key: string): CorrelationAlias {
+  const kind = key.slice(0, key.indexOf(":"));
+  if (!kind) throw new Error(`invalid correlation key ${key}`);
+  return { kind, key };
+}
+
+function canonicalForWorkItem(item: WorkItem): CanonicalConversation {
+  return {
+    key: item.canonicalKey,
+    kind: aliasFromKey(item.canonicalKey).kind as CanonicalConversation["kind"],
+  };
+}
+
+function workItemKind(kind: string): WorkItemKind {
+  if (kind === "linear" || kind === "github" || kind === "slack") return kind;
+  return "email";
+}
+
+function authenticatedPromptInput(
+  request: AgentRequest,
+  person: Person,
+  item: WorkItem,
+  policy: EffectivePolicy,
+  assessment: SafetyAssessment,
+  execution: SafetyWrappedPromptInput["execution"],
+): SafetyWrappedPromptInput {
+  return {
+    requestId: request.id,
+    principal: {
+      id: person.id,
+      nickname: person.nickname,
+      roleName: person.roleName,
+    },
+    source: request.event.source,
+    ...(hasGithubReviewSubmissionAuthority(request.event)
+      ? { sourceAction: "github-pr-review" as const }
+      : {}),
+    sourceDeliveryId: request.sourceDeliveryId,
+    canonicalWorkItem: item.canonicalKey,
+    requestText: request.requestText,
+    providerContext: {
+      summary: request.event.summary,
+      payload: request.event.payload,
+    },
+    rolePolicy: policy.policy,
+    assessment,
+    execution,
+    presentation: {
+      title: item.title,
+      description: buildWorkItemTitle(request.event, person),
+    },
+  };
+}
+
+function executionPlan(
+  profile: ExecutionProfile,
+  isNewDesktopTask: boolean,
+  title: string,
+  resumeDelegation = false,
+): SafetyWrappedPromptInput["execution"] {
+  const targetIsDefault =
+    profile.source === "default" ||
+    (profile.model === DEFAULT_EXECUTION_PROFILE.model &&
+      profile.reasoningEffort === DEFAULT_EXECUTION_PROFILE.reasoningEffort);
+  const delegateToSeparateTask =
+    profile.clarification === null &&
+    (resumeDelegation || profile.mode === "separate" || (isNewDesktopTask && !targetIsDefault));
+  const delegationReason = delegateToSeparateTask
+    ? profile.mode === "separate"
+      ? "requested-separate"
+      : "new-desktop-task-override"
+    : null;
+  const currentProfile = delegateToSeparateTask ? DEFAULT_EXECUTION_PROFILE : profile;
+  return {
+    currentModel: currentProfile.model,
+    currentReasoningEffort: currentProfile.reasoningEffort,
+    requestProfile: profile,
+    delegateToSeparateTask,
+    delegationReason,
+    ...(delegateToSeparateTask ? { childTitle: executionChildTitle(title, profile) } : {}),
+  };
+}
+
+function executionChildTitle(title: string, profile: ExecutionProfile): string {
+  const model = executionModelLabel(profile.model);
+  const suffix = ` — ${model} ${profile.reasoningEffort}`;
+  const prefix = title.slice(0, Math.max(1, 60 - suffix.length)).trimEnd();
+  return `${prefix}${suffix}`;
+}
+
+function executionModelLabel(model: ExecutionProfile["model"]): string {
+  if (model === "gpt-5.6-luna") return "Luna";
+  if (model === "gpt-5.6-terra") return "Terra";
+  if (model === "gpt-5.6-sol") return "Sol";
+  if (model === "gpt-5.4-mini") return "5.4 Mini";
+  if (model === "gpt-5.3-codex-spark") return "Spark";
+  return model.replace("gpt-", "");
+}
+
+function sandboxForPolicy(policy: EffectivePolicy): "read-only" | "workspace-write" {
+  const { filesystem, shell } = policy.policy.capabilities;
+  return filesystem === "write" || filesystem === "full" || shell === "write" || shell === "full"
+    ? "workspace-write"
+    : "read-only";
+}
+
+function isLinearStopRequest(event: WakeEvent): boolean {
+  return isPrivilegedLinearAgentSessionEvent(event) && event.payload.agentSignal === "stop";
+}
+
+function isGithubPullRequestEvent(event: WakeEvent): boolean {
+  return (
+    event.source === "github" &&
+    (event.payload.isPullRequest === true || event.kind.startsWith("pull_request"))
+  );
+}
+
+function hasGithubReviewSubmissionAuthority(event: WakeEvent): boolean {
+  return (
+    isGithubPullRequestEvent(event) &&
+    stringPayload(event, "pullRequestAuthorLogin").toLowerCase() !== "chipbyte-snap"
+  );
+}
+
+const REVIEW_REASONING_EFFORTS: readonly ExecutionReasoningEffort[] = [
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+];
+
+function enforceGithubPrReviewEffort(
+  event: WakeEvent,
+  profile: ExecutionProfile,
+): ExecutionProfile {
+  if (
+    !isGithubPullRequestEvent(event) ||
+    profile.clarification !== null ||
+    REVIEW_REASONING_EFFORTS.indexOf(profile.reasoningEffort) >=
+      REVIEW_REASONING_EFFORTS.indexOf("high")
+  ) {
+    return profile;
+  }
+  return { ...profile, reasoningEffort: "high" };
+}
+
+function isGithubReviewStartRequest(event: WakeEvent): boolean {
+  if (!isGithubPullRequestEvent(event)) return false;
+  if (event.kind === "pull_request.review_requested") return true;
+  const body = stringPayload(event, "body")
+    .replace(/@chipbyte-snap\b|@chip\b/giu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  return /^(?:please\s+)?(?:review|rereview|re-review)(?:\s+(?:this|again|please))?[.!]?$/iu.test(
+    body,
+  );
+}
+
+function maintainedPrFeedbackKey(event: WakeEvent): string {
+  const repositoryId = identifier(event.payload.repositoryId);
+  const number = identifier(event.payload.number);
+  if (!repositoryId || !number) {
+    throw new Error("maintained PR feedback is missing repository id or PR number");
+  }
+  return `github-maintained-pr-feedback:${repositoryId}#${number}`;
+}
+
+function githubPullRequestUrl(event: WakeEvent): string {
+  const explicit =
+    stringPayload(event, "issueUrl") ||
+    stringPayload(event, "pullRequestUrl") ||
+    stringPayload(event, "url");
+  if (/^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+(?:$|[#?])/u.test(explicit)) {
+    return explicit.replace(/#.*$/u, "");
+  }
+  const repo = stringPayload(event, "repo");
+  const number = identifier(event.payload.number);
+  return repo && number ? `https://github.com/${repo}/pull/${number}` : "";
+}
+
+function trustedResumeCwd(cwd: string | null): string {
+  const candidate = cwd?.trim();
+  if (!candidate) return SNAP_ROOT;
+  const resolved = path.resolve(candidate);
+  return resolved === SNAP_ROOT || path.dirname(resolved) === SNAP_ROOT ? resolved : SNAP_ROOT;
+}
+
+function supportsProgressAck(event: WakeEvent): boolean {
+  return (
+    event.source === "slack" ||
+    event.source === "github" ||
+    isPrivilegedLinearAgentSessionEvent(event) ||
+    isPrivilegedLinearUserEvent(event)
+  );
+}
+
+function stringPayload(event: WakeEvent, key: string): string {
+  const value = event.payload[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function identifier(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  return typeof value === "number" && Number.isFinite(value) ? String(value) : "";
+}
+
+function stripAngles(value: string): string {
+  return value.startsWith("<") && value.endsWith(">") ? value.slice(1, -1).trim() : value.trim();
+}
+
+function digest(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function deduplicate(aliases: CorrelationAlias[]): CorrelationAlias[] {
+  const seen = new Set<string>();
+  return aliases.filter((alias) => {
+    if (seen.has(alias.key)) return false;
+    seen.add(alias.key);
+    return true;
+  });
+}

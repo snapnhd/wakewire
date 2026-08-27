@@ -9,6 +9,16 @@ const execFileAsync = promisify(execFile);
 
 const LAUNCHD_LABEL = "io.wakewire.daemon";
 
+export interface LaunchdEnvironmentOptions {
+  homeDir?: string;
+  nodePath?: string;
+  environment?: NodeJS.ProcessEnv;
+}
+
+export interface LaunchdPlistOptions extends LaunchdEnvironmentOptions {
+  logsDirectory?: string;
+}
+
 /**
  * launchd (macOS) / systemd user unit (Linux) registration so the daemon
  * starts at login. Windows: run under a terminal or NSSM — documented in the
@@ -62,27 +72,108 @@ export async function uninstallService(): Promise<void> {
   console.log("Nothing to uninstall on this platform.");
 }
 
-function launchdPlist(cliPath: string): string {
-  const stdout = path.join(logsDir(), "launchd.out.log");
-  const stderr = path.join(logsDir(), "launchd.err.log");
+export function launchdEnvironment(options: LaunchdEnvironmentOptions = {}): {
+  MISE_DATA_DIR: string;
+  PATH: string;
+} {
+  const homeDir = options.homeDir ?? os.homedir();
+  const nodePath = options.nodePath ?? process.execPath;
+  const environment = options.environment ?? process.env;
+  const miseDataDir = resolveMiseDataDir(homeDir, nodePath, environment);
+  const pathEntries = [
+    path.join(miseDataDir, "shims"),
+    path.dirname(nodePath),
+    path.join(homeDir, ".local", "bin"),
+    path.join(homeDir, ".homebrew", "bin"),
+    path.join(homeDir, ".homebrew", "sbin"),
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/Applications/ChatGPT.app/Contents/Resources",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+  ];
+
+  return {
+    MISE_DATA_DIR: miseDataDir,
+    PATH: [...new Set(pathEntries.map((entry) => path.normalize(entry)))].join(":"),
+  };
+}
+
+export function launchdPlist(cliPath: string, options: LaunchdPlistOptions = {}): string {
+  const nodePath = options.nodePath ?? process.execPath;
+  const homeDir = options.homeDir ?? os.homedir();
+  const serviceEnvironment = launchdEnvironment(options);
+  const logDirectory = options.logsDirectory ?? logsDir();
+  const stdout = path.join(logDirectory, "launchd.out.log");
+  const stderr = path.join(logDirectory, "launchd.err.log");
+  const wrapper = path.join(homeDir, ".local", "bin", "wakewire-launchd");
+  const programArguments = fs.existsSync(wrapper)
+    ? `    <string>${escapeXml(wrapper)}</string>`
+    : `    <string>${escapeXml(nodePath)}</string>
+    <string>${escapeXml(cliPath)}</string>
+    <string>start</string>`;
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>${LAUNCHD_LABEL}</string>
+  <key>Label</key><string>${escapeXml(LAUNCHD_LABEL)}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${process.execPath}</string>
-    <string>${cliPath}</string>
-    <string>start</string>
+${programArguments}
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MISE_DATA_DIR</key><string>${escapeXml(serviceEnvironment.MISE_DATA_DIR)}</string>
+    <key>PATH</key><string>${escapeXml(serviceEnvironment.PATH)}</string>
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>${stdout}</string>
-  <key>StandardErrorPath</key><string>${stderr}</string>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>${escapeXml(stdout)}</string>
+  <key>StandardErrorPath</key><string>${escapeXml(stderr)}</string>
 </dict>
 </plist>
 `;
+}
+
+function resolveMiseDataDir(
+  homeDir: string,
+  nodePath: string,
+  environment: NodeJS.ProcessEnv,
+): string {
+  const configured = environment.MISE_DATA_DIR?.trim();
+  if (configured) return absoluteDirectory("MISE_DATA_DIR", configured);
+
+  const installsSegment = `${path.sep}installs${path.sep}`;
+  const installsIndex = nodePath.lastIndexOf(installsSegment);
+  if (installsIndex > 0) return path.normalize(nodePath.slice(0, installsIndex));
+
+  const xdgDataHome = environment.XDG_DATA_HOME?.trim();
+  if (xdgDataHome) {
+    return path.join(absoluteDirectory("XDG_DATA_HOME", xdgDataHome), "mise");
+  }
+
+  const configuredHome = path.join(homeDir, ".config", "mise");
+  if (fs.existsSync(configuredHome)) return configuredHome;
+  return path.join(homeDir, ".local", "share", "mise");
+}
+
+function absoluteDirectory(name: string, value: string): string {
+  if (!path.isAbsolute(value)) throw new Error(`${name} must be an absolute path`);
+  return path.normalize(value);
+}
+
+function escapeXml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
 }
 
 function systemdUnit(cliPath: string): string {

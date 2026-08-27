@@ -2,6 +2,7 @@ import { OAuth2Client } from "google-auth-library";
 import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
 import { z } from "zod";
+import type { WakeEvent } from "../../core/event.js";
 import type { SecretStore } from "../../secrets/store.js";
 import { secretNames } from "../../secrets/store.js";
 import type { Source, SourceContext } from "../types.js";
@@ -176,24 +177,34 @@ export class GmailImapSource implements Source {
       { uid: true },
     )) {
       if (message.uid <= (this.state.lastSeenUid ?? 0)) continue; // `${n}:*` includes the last message even when n > it
-      maxUid = Math.max(maxUid, message.uid);
-      if (!message.source) continue;
+      if (!message.source) {
+        maxUid = Math.max(maxUid, message.uid);
+        continue;
+      }
+      let event: WakeEvent;
       try {
         const mail = await simpleParser(message.source);
-        const event = emailToWakeEvent({
+        event = emailToWakeEvent({
           mail,
           label: this.config.label,
           fallbackId: `imap-${this.id}-${this.state.uidValidity}-${message.uid}`,
+          mailbox: this.config.auth.user,
+          sourceId: this.id,
         });
-        this.received++;
-        this.lastEventAt = new Date().toISOString();
-        this.ctx.emit(event);
       } catch (err) {
         this.ctx.logger.warn(
           { source: this.id, uid: message.uid, err: String(err) },
           "failed to parse message — skipped",
         );
+        maxUid = Math.max(maxUid, message.uid);
+        continue;
       }
+      // Do not catch a durable-ingress failure: abort this pass without
+      // advancing the UID watermark so IMAP reconnect retries the message.
+      this.ctx.emit(event);
+      this.received++;
+      this.lastEventAt = new Date().toISOString();
+      maxUid = Math.max(maxUid, message.uid);
     }
     if (maxUid > (this.state.lastSeenUid ?? 0)) {
       this.state.lastSeenUid = maxUid;

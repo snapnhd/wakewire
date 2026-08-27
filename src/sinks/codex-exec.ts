@@ -3,12 +3,30 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Logger } from "../logging.js";
+import { CodexAppServerThreadMetadata, type CodexThreadMetadata } from "./codex-thread-metadata.js";
 import type { AgentAdapter, DeliveryOptions, DeliveryResult } from "./types.js";
 import { PermanentError, UnreachableError } from "./types.js";
 
 export interface CodexExecAdapterConfig {
   codexPath?: string | undefined;
   model?: string | undefined;
+}
+
+export interface CodexExecAdapterDependencies {
+  threadMetadata?: CodexThreadMetadata | undefined;
+}
+
+export function codexExecExecutionSettingArgs(
+  opts: Pick<DeliveryOptions, "model" | "reasoningEffort">,
+  fallbackModel?: string | undefined,
+): string[] {
+  const args: string[] = [];
+  const model = opts.model ?? fallbackModel;
+  if (model) args.push("--model", model);
+  if (opts.reasoningEffort) {
+    args.push("--config", `model_reasoning_effort="${opts.reasoningEffort}"`);
+  }
+  return args;
 }
 
 /**
@@ -18,11 +36,17 @@ export interface CodexExecAdapterConfig {
  */
 export class CodexExecAdapter implements AgentAdapter {
   readonly name = "codex-exec";
+  private readonly threadMetadata: CodexThreadMetadata;
 
   constructor(
     private readonly logger: Logger,
     private readonly config: CodexExecAdapterConfig = {},
-  ) {}
+    dependencies: CodexExecAdapterDependencies = {},
+  ) {
+    this.threadMetadata =
+      dependencies.threadMetadata ??
+      new CodexAppServerThreadMetadata(logger, { codexPath: config.codexPath });
+  }
 
   async deliverToThread(
     threadId: string,
@@ -57,6 +81,14 @@ export class CodexExecAdapter implements AgentAdapter {
     }
   }
 
+  async setThreadTitle(threadId: string, title: string): Promise<void> {
+    await this.threadMetadata.setThreadTitle(threadId, title);
+  }
+
+  close(): void {
+    this.threadMetadata.close?.();
+  }
+
   private baseArgs(
     opts: DeliveryOptions,
     flags: { cd?: boolean } = {},
@@ -74,7 +106,7 @@ export class CodexExecAdapter implements AgentAdapter {
       "--output-last-message",
       lastMessageFile,
     ];
-    if (this.config.model) args.push("--model", this.config.model);
+    args.push(...codexExecExecutionSettingArgs(opts, this.config.model));
     if (flags.cd && opts.cwd) args.push("--cd", opts.cwd);
     return { args, lastMessageFile };
   }

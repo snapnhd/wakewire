@@ -1,7 +1,13 @@
 import { execFile } from "node:child_process";
 import { Codex, type ThreadOptions } from "@openai/codex-sdk";
 import type { Logger } from "../logging.js";
-import type { AgentAdapter, DeliveryOptions, DeliveryResult } from "./types.js";
+import { CodexAppServerThreadMetadata, type CodexThreadMetadata } from "./codex-thread-metadata.js";
+import type {
+  AgentAdapter,
+  CodexReasoningEffort,
+  DeliveryOptions,
+  DeliveryResult,
+} from "./types.js";
 import { PermanentError, UnreachableError } from "./types.js";
 
 export interface CodexSdkAdapterConfig {
@@ -9,6 +15,38 @@ export interface CodexSdkAdapterConfig {
   codexPath?: string | undefined;
   /** Model override for injected turns. */
   model?: string | undefined;
+}
+
+export interface CodexSdkAdapterDependencies {
+  threadMetadata?: CodexThreadMetadata | undefined;
+}
+
+/**
+ * @openai/codex-sdk 0.144.1 types predate `max` and `ultra`, but its runtime
+ * forwards this value unchanged as the CLI's model_reasoning_effort config.
+ * Keep the compatibility assertion isolated to this one boundary.
+ */
+function sdkReasoningEffort(
+  effort: CodexReasoningEffort,
+): NonNullable<ThreadOptions["modelReasoningEffort"]> {
+  return effort as NonNullable<ThreadOptions["modelReasoningEffort"]>;
+}
+
+export function codexSdkThreadOptions(
+  opts: DeliveryOptions,
+  fallbackModel?: string | undefined,
+): ThreadOptions {
+  const model = opts.model ?? fallbackModel;
+  return {
+    sandboxMode: opts.sandbox,
+    approvalPolicy: "never",
+    skipGitRepoCheck: true,
+    ...(opts.cwd ? { workingDirectory: opts.cwd } : {}),
+    ...(model ? { model } : {}),
+    ...(opts.reasoningEffort
+      ? { modelReasoningEffort: sdkReasoningEffort(opts.reasoningEffort) }
+      : {}),
+  };
 }
 
 /**
@@ -24,12 +62,17 @@ export interface CodexSdkAdapterConfig {
 export class CodexSdkAdapter implements AgentAdapter {
   readonly name = "codex-sdk";
   private readonly codex: Codex;
+  private readonly threadMetadata: CodexThreadMetadata;
 
   constructor(
     private readonly logger: Logger,
     private readonly config: CodexSdkAdapterConfig = {},
+    dependencies: CodexSdkAdapterDependencies = {},
   ) {
     this.codex = new Codex(config.codexPath ? { codexPathOverride: config.codexPath } : {});
+    this.threadMetadata =
+      dependencies.threadMetadata ??
+      new CodexAppServerThreadMetadata(logger, { codexPath: config.codexPath });
   }
 
   async deliverToThread(
@@ -57,14 +100,16 @@ export class CodexSdkAdapter implements AgentAdapter {
     });
   }
 
+  async setThreadTitle(threadId: string, title: string): Promise<void> {
+    await this.threadMetadata.setThreadTitle(threadId, title);
+  }
+
+  close(): void {
+    this.threadMetadata.close?.();
+  }
+
   private threadOptions(opts: DeliveryOptions): ThreadOptions {
-    return {
-      sandboxMode: opts.sandbox,
-      approvalPolicy: "never", // unattended: never block on approval prompts
-      skipGitRepoCheck: true,
-      ...(opts.cwd ? { workingDirectory: opts.cwd } : {}),
-      ...(this.config.model ? { model: this.config.model } : {}),
-    };
+    return codexSdkThreadOptions(opts, this.config.model);
   }
 
   private async runMapped<T>(fn: () => Promise<T>, threadId: string | null): Promise<T> {

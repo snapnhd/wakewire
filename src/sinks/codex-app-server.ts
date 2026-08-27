@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Logger } from "../logging.js";
+import { validateCodexThreadId, validateCodexThreadTitle } from "./codex-thread-metadata.js";
 import { JsonRpcChild, type JsonRpcConnection, JsonRpcError, JsonRpcWs } from "./jsonrpc.js";
 import type { AgentAdapter, DeliveryOptions, DeliveryResult } from "./types.js";
 import { BusyError, PermanentError, UnreachableError } from "./types.js";
@@ -114,13 +115,25 @@ export class CodexAppServerAdapter implements AgentAdapter {
 
   async startThread(prompt: string, opts: DeliveryOptions): Promise<DeliveryResult> {
     const rpc = await this.connect();
+    const model = opts.model ?? this.config.model;
     const started = await this.call<ThreadResumeResponse>(rpc, "thread/start", {
       ...(opts.cwd ? { cwd: opts.cwd } : {}),
       sandbox: opts.sandbox,
       approvalPolicy: "never",
-      ...(this.config.model ? { model: this.config.model } : {}),
+      ...(model ? { model } : {}),
+      ...(opts.reasoningEffort ? { config: { model_reasoning_effort: opts.reasoningEffort } } : {}),
     });
     return this.runTurn(rpc, started.thread.id, prompt, opts);
+  }
+
+  async setThreadTitle(threadId: string, title: string): Promise<void> {
+    const normalizedThreadId = validateCodexThreadId(threadId);
+    const normalizedTitle = validateCodexThreadTitle(title);
+    const rpc = await this.connect();
+    await this.call(rpc, "thread/name/set", {
+      threadId: normalizedThreadId,
+      name: normalizedTitle,
+    });
   }
 
   /**
@@ -140,12 +153,14 @@ export class CodexAppServerAdapter implements AgentAdapter {
     const completion = this.awaitTurnCompletion(threadId);
     let turnId: string;
     try {
+      const model = opts.model ?? this.config.model;
       const started = await this.call<TurnStartResponse>(rpc, "turn/start", {
         threadId,
         input: [{ type: "text", text: prompt }],
         approvalPolicy: "never",
         sandboxPolicy: sandboxPolicyFor(opts),
-        ...(this.config.model ? { model: this.config.model } : {}),
+        ...(model ? { model } : {}),
+        ...(opts.reasoningEffort ? { effort: opts.reasoningEffort } : {}),
       });
       turnId = started.turn.id;
     } catch (err) {

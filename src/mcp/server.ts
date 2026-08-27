@@ -25,6 +25,124 @@ export async function runMcpServer(): Promise<void> {
   );
 
   server.registerTool(
+    "wakewire_followup_register",
+    {
+      title: "Register a WakeWire scheduled follow-up",
+      description:
+        "Bind a paused, thread-targeted Codex automation to the authenticated WakeWire request " +
+        "that created it. Register before activating the automation; provider reply targets remain " +
+        "server-side and cannot be supplied by the caller.",
+      inputSchema: {
+        automationId: z.string().min(1).describe("Codex automation id"),
+        originRequestId: z.string().min(1).describe("Authenticated WakeWire request id"),
+        currentCodexThreadId: z
+          .string()
+          .min(1)
+          .describe("Current Codex task id from CODEX_THREAD_ID"),
+      },
+    },
+    async (args) => call("POST", "/api/scheduled-followups/register", args),
+  );
+
+  server.registerTool(
+    "wakewire_followup_complete",
+    {
+      title: "Complete a WakeWire scheduled follow-up",
+      description:
+        "Queue the terminal message exactly once through WakeWire's durable provider reply outbox. " +
+        "The opaque binding, automation id, and current Codex task must all match.",
+      inputSchema: {
+        followupId: z.string().min(1).describe("Opaque id returned by registration"),
+        automationId: z.string().min(1).describe("Codex automation id"),
+        currentCodexThreadId: z
+          .string()
+          .min(1)
+          .describe("Current Codex task id from CODEX_THREAD_ID"),
+        message: z.string().min(1).describe("Exact terminal message body"),
+      },
+    },
+    async ({ followupId, ...body }) =>
+      call("POST", `/api/scheduled-followups/${encodeURIComponent(followupId)}/complete`, body),
+  );
+
+  server.registerTool(
+    "wakewire_followup_status",
+    {
+      title: "Inspect a WakeWire scheduled follow-up",
+      description: "Show a scheduled follow-up binding and its terminal provider-reply status.",
+      inputSchema: {
+        followupId: z.string().min(1).describe("Opaque id returned by registration"),
+      },
+    },
+    async ({ followupId }) =>
+      call("GET", `/api/scheduled-followups/${encodeURIComponent(followupId)}`),
+  );
+
+  server.registerTool(
+    "wakewire_scheduled_channel_register",
+    {
+      title: "Register a recurring WakeWire Slack channel delivery",
+      description:
+        "Bind an existing thread-targeted Codex automation to the authenticated WakeWire " +
+        "request that created it. WakeWire derives the exact Slack workspace/channel from the " +
+        "frozen origin; callers cannot supply or retarget a destination.",
+      inputSchema: {
+        automationId: z.string().min(1).describe("Codex automation id"),
+        originRequestId: z.string().min(1).describe("Authenticated WakeWire request id"),
+        currentCodexThreadId: z
+          .string()
+          .min(1)
+          .describe("Current Codex task id from CODEX_THREAD_ID"),
+      },
+    },
+    async (args) => call("POST", "/api/scheduled-channel-deliveries/register", args),
+  );
+
+  server.registerTool(
+    "wakewire_scheduled_channel_send",
+    {
+      title: "Send one recurring Slack channel occurrence through WakeWire",
+      description:
+        "Queue one top-level Slack message through Chip's WakeWire user token. The opaque " +
+        "binding fixes the channel, and occurrenceKey makes identical retries idempotent while " +
+        "conflicting content fails closed.",
+      inputSchema: {
+        deliveryId: z.string().min(1).describe("Opaque id returned by registration"),
+        automationId: z.string().min(1).describe("Codex automation id"),
+        currentCodexThreadId: z
+          .string()
+          .min(1)
+          .describe("Current Codex task id from CODEX_THREAD_ID"),
+        occurrenceKey: z
+          .string()
+          .min(1)
+          .describe("Stable logical run key, for example 2026-07-29@America/Chicago"),
+        message: z.string().min(1).describe("Exact top-level Slack message body"),
+      },
+    },
+    async ({ deliveryId, ...body }) =>
+      call(
+        "POST",
+        `/api/scheduled-channel-deliveries/${encodeURIComponent(deliveryId)}/send`,
+        body,
+      ),
+  );
+
+  server.registerTool(
+    "wakewire_scheduled_channel_status",
+    {
+      title: "Inspect a recurring WakeWire Slack channel binding",
+      description:
+        "Show the immutable automation/task binding without exposing its Slack destination.",
+      inputSchema: {
+        deliveryId: z.string().min(1).describe("Opaque id returned by registration"),
+      },
+    },
+    async ({ deliveryId }) =>
+      call("GET", `/api/scheduled-channel-deliveries/${encodeURIComponent(deliveryId)}`),
+  );
+
+  server.registerTool(
     "wakewire_route_add",
     {
       title: "Add a wakewire route",
@@ -32,8 +150,8 @@ export async function runMcpServer(): Promise<void> {
         "Create a route that delivers matching external events into a Codex thread. " +
         'For GitHub, match is like {"repo":"owner/repo","events":["push"],"branches":["main"]}. ' +
         'For Gmail, match is like {"label":"agent-inbox"} (a label is required). ' +
-        'For Slack, match is like {"events":["app_mention"]} or {"channels":["#dev"],"events":["message"]} ' +
-        "(matching plain messages requires naming channels). " +
+        'For ordinary Slack routing, match is like {"channels":["#dev"],"events":["message"]} ' +
+        "(messages require named channels; Chip mentions and PMs use the separate dispatcher). " +
         'For generic webhook sources, match is like {"provider":"sentry","events":["issue"],"where":[{"field":"level","equals":"error"}]}. ' +
         'target.type "this-thread" targets the current conversation — the tool will tell you how to resolve the thread id if it cannot.',
       inputSchema: {
@@ -275,7 +393,12 @@ export async function runMcpServer(): Promise<void> {
     {
       title: "Set up the Slack event source",
       description:
-        "Register a Slack workspace watch over Socket Mode (outbound WebSocket — no public URL). " +
+        "Register exact mentions and one-to-one direct messages to Chip's existing normal " +
+        "Slack account over a user-authorized Socket Mode app " +
+        "(outbound WebSocket — no public URL). " +
+        "For a new source, omitted delivery options default to bots off and direct messages/" +
+        "channel mentions on; repeat setup preserves omitted options and identity pins while " +
+        "the agent email is unchanged. " +
         "Returns the one-time Slack app setup steps; the tokens themselves are stored in a " +
         "terminal via `wakewire auth slack`, never through this conversation.",
       inputSchema: {
@@ -283,10 +406,31 @@ export async function runMcpServer(): Promise<void> {
           .string()
           .optional()
           .describe("Workspace name, informational — used in the source id (default: default)"),
+        agentEmail: z
+          .string()
+          .email()
+          .optional()
+          .describe(
+            "Email on the existing normal Slack account for Chip (new-source default: chip@snapcorp.com; omitted on repeat setup preserves the current email)",
+          ),
         includeBotMessages: z
           .boolean()
           .optional()
-          .describe("Also deliver messages posted by bots/integrations (default false)"),
+          .describe(
+            "Also deliver messages posted by bots/integrations (new-source default: false; omitted on repeat setup preserves the current setting)",
+          ),
+        includeDirectMessages: z
+          .boolean()
+          .optional()
+          .describe(
+            "Treat one-to-one messages to Chip as Chip requests (new-source default: true; omitted on repeat setup preserves the current setting)",
+          ),
+        includeChannelMentions: z
+          .boolean()
+          .optional()
+          .describe(
+            "Treat exact resolved mentions of Chip's Slack user ID as requests (new-source default: true; omitted on repeat setup preserves the current setting)",
+          ),
       },
     },
     async (args) => call("POST", "/api/sources/slack/setup", args),

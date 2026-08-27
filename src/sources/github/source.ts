@@ -2,6 +2,7 @@ import { SmeeClient } from "smee-client";
 import { z } from "zod";
 import type { SecretStore } from "../../secrets/store.js";
 import { secretNames } from "../../secrets/store.js";
+import { signedBodyDeliveryId } from "../signed-delivery.js";
 import type { Source, SourceContext } from "../types.js";
 import { trimGithubEvent } from "./trim.js";
 import { verifyGithubSignature } from "./verify.js";
@@ -121,10 +122,10 @@ export class GithubWebhookSource implements Source {
     signature: string | undefined;
     rawBody: string;
   }): Promise<{ status: number; message: string }> {
-    const { eventName, deliveryId, signature, rawBody } = args;
-    if (!eventName || !deliveryId) {
+    const { eventName, signature, rawBody } = args;
+    if (!eventName) {
       this.rejected++;
-      return { status: 400, message: "missing X-GitHub-Event or X-GitHub-Delivery" };
+      return { status: 400, message: "missing X-GitHub-Event" };
     }
     const secret = this.secrets.get(secretNames.githubWebhookSecret(this.id));
     if (!secret) {
@@ -145,7 +146,14 @@ export class GithubWebhookSource implements Source {
     if (eventName === "ping") {
       return { status: 200, message: "pong" };
     }
-    const event = trimGithubEvent({ eventName, deliveryId, payload });
+    // X-GitHub-Delivery is not covered by the webhook HMAC and a public relay
+    // observer can replace it. Use the verified body itself as the replay key.
+    const event = trimGithubEvent({
+      eventName,
+      deliveryId: signedBodyDeliveryId("github", rawBody),
+      payload,
+      sourceId: this.id,
+    });
     if (!event) {
       return { status: 200, message: "event has no repository — ignored" };
     }

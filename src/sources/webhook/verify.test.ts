@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { WebhookSourceConfigSchema } from "./source.js";
-import { verifyWebhook } from "./verify.js";
+import { isFreshLinearWebhook, verifyWebhook } from "./verify.js";
 
 const secret = "shhh";
 const body = JSON.stringify({ id: "evt_1", type: "issue.created" });
@@ -55,6 +55,17 @@ describe("verifyWebhook — hmac-sha256", () => {
 });
 
 describe("WebhookSourceConfigSchema", () => {
+  it("preserves a configured Linear app user id for privileged source pinning", () => {
+    expect(
+      WebhookSourceConfigSchema.parse({
+        name: "linear",
+        mode: "listen",
+        verification: { kind: "hmac-sha256", header: "linear-signature" },
+        linearAppUserId: "  chip-app-user  ",
+      }).linearAppUserId,
+    ).toBe("chip-app-user");
+  });
+
   it("rejects secret-header verification in smee mode (relay would leak the bearer)", () => {
     const secretHeader = { kind: "secret-header", header: "x-token" } as const;
     expect(
@@ -91,5 +102,15 @@ describe("verifyWebhook — secret-header", () => {
     expect(verifyWebhook(config, secret, body, "shhh ")).toBe(false);
     expect(verifyWebhook(config, secret, body, "nope")).toBe(false);
     expect(verifyWebhook(config, secret, body, undefined)).toBe(false);
+  });
+});
+
+describe("isFreshLinearWebhook", () => {
+  it("accepts only timestamps within Linear's one-minute replay window", () => {
+    const now = 1_700_000_000_000;
+    expect(isFreshLinearWebhook({ webhookTimestamp: now - 60_000 }, now)).toBe(true);
+    expect(isFreshLinearWebhook({ webhookTimestamp: String(now + 1_000) }, now)).toBe(true);
+    expect(isFreshLinearWebhook({ webhookTimestamp: now - 60_001 }, now)).toBe(false);
+    expect(isFreshLinearWebhook({}, now)).toBe(false);
   });
 });

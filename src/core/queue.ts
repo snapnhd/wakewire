@@ -37,7 +37,8 @@ export class DeliveryQueue {
   private readonly now: () => Date;
   private readonly inFlight = new Set<string>();
   private timer: NodeJS.Timeout | null = null;
-  private ticking = false;
+  private activeTick: Promise<void> | null = null;
+  private stopping = false;
 
   constructor(
     private readonly stores: Stores,
@@ -54,6 +55,7 @@ export class DeliveryQueue {
 
   start(): void {
     if (this.timer) return;
+    this.stopping = false;
     const recovered = this.stores.deliveries.resetInFlight();
     if (recovered > 0) {
       this.logger.warn({ recovered }, "reset stale in-flight deliveries to queued");
@@ -63,11 +65,13 @@ export class DeliveryQueue {
     void this.tick();
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
+    this.stopping = true;
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
     }
+    if (this.activeTick) await this.activeTick;
   }
 
   /** Render the prompt for a matched event and persist it as a queued delivery. */
@@ -119,42 +123,49 @@ export class DeliveryQueue {
   }
 
   wake(): void {
+    if (this.stopping) return;
     void this.tick();
   }
 
   /** One scheduler pass. Public for deterministic tests. */
   async tick(): Promise<void> {
-    if (this.ticking) return;
-    this.ticking = true;
+    if (this.stopping || this.activeTick) return;
+    const activeTick = this.runTick();
+    this.activeTick = activeTick;
     try {
-      const ready = this.stores.deliveries.listReady(this.now().toISOString());
-      const jobs: Array<Promise<void>> = [];
-      const claimed = new Set<string>();
-
-      for (const delivery of ready) {
-        const route = this.stores.routes.get(delivery.routeId);
-        if (!route) {
-          this.stores.deliveries.markFailed(delivery.id, "route no longer exists");
-          continue;
-        }
-        if (!route.enabled) continue;
-        const key = threadKey(route);
-        if (this.inFlight.has(key) || claimed.has(key)) continue; // strict per-thread FIFO
-        claimed.add(key);
-
-        const batch = this.maybeCoalesce(route, delivery, ready);
-        this.inFlight.add(key);
-        this.stores.deliveries.markDelivering(batch.id);
-        jobs.push(
-          this.process(route, batch).finally(() => {
-            this.inFlight.delete(key);
-          }),
-        );
-      }
-      await Promise.all(jobs);
+      await activeTick;
     } finally {
-      this.ticking = false;
+      if (this.activeTick === activeTick) this.activeTick = null;
     }
+  }
+
+  private async runTick(): Promise<void> {
+    const ready = this.stores.deliveries.listReady(this.now().toISOString());
+    const jobs: Array<Promise<void>> = [];
+    const claimed = new Set<string>();
+
+    for (const delivery of ready) {
+      if (this.stopping) break;
+      const route = this.stores.routes.get(delivery.routeId);
+      if (!route) {
+        this.stores.deliveries.markFailed(delivery.id, "route no longer exists");
+        continue;
+      }
+      if (!route.enabled) continue;
+      const key = threadKey(route);
+      if (this.inFlight.has(key) || claimed.has(key)) continue; // strict per-thread FIFO
+      claimed.add(key);
+
+      const batch = this.maybeCoalesce(route, delivery, ready);
+      this.inFlight.add(key);
+      this.stores.deliveries.markDelivering(batch.id);
+      jobs.push(
+        this.process(route, batch).finally(() => {
+          this.inFlight.delete(key);
+        }),
+      );
+    }
+    await Promise.all(jobs);
   }
 
   queueDepth(): number {
@@ -227,7 +238,7 @@ export class DeliveryQueue {
   }
 
   private async deliver(route: Route, delivery: Delivery, prompt: string) {
-    const opts = { sandbox: route.sandbox };
+    const opts = { sandbox: route.sandbox, idempotencyKey: delivery.id };
     if (route.target.type === "thread") {
       return this.adapter.deliverToThread(route.target.threadId, prompt, opts);
     }

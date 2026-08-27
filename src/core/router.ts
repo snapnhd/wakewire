@@ -45,8 +45,10 @@ function matchWebhook(match: WebhookMatch, event: WakeEvent): boolean {
 
 function matchSlack(match: SlackMatch, event: WakeEvent): boolean {
   // route "message" matches kind "message.channel_topic"; exact kinds match exactly.
-  // Defensive default: rows stored before match normalization may lack events.
-  const events = match.events ?? ["app_mention"];
+  // Stored rows that predate explicit Slack events fail closed. In particular,
+  // never turn a missing field into the bot-only app_mention event implicitly.
+  const events = match.events;
+  if (!Array.isArray(events) || events.length === 0) return false;
   const kindMatches = events.some((e) => event.kind === e || event.kind.startsWith(`${e}.`));
   if (!kindMatches) return false;
 

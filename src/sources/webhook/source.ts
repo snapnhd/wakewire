@@ -2,9 +2,16 @@ import { SmeeClient } from "smee-client";
 import { z } from "zod";
 import type { SecretStore } from "../../secrets/store.js";
 import { secretNames } from "../../secrets/store.js";
+import {
+  InvalidLinearAgentSessionEventError,
+  linearAgentSessionToWakeEvent,
+} from "../linear/agent-session.js";
+import { normalizeLinearAgentEvent } from "../linear/normalize.js";
+import { InvalidLinearUserEventError, linearUserEventToWakeEvent } from "../linear/user-event.js";
+import { signedBodyDeliveryId } from "../signed-delivery.js";
 import type { Source, SourceContext } from "../types.js";
 import { mapWebhookEvent, WebhookMappingSchema } from "./map.js";
-import { verifyWebhook, WebhookVerificationSchema } from "./verify.js";
+import { isFreshLinearWebhook, verifyWebhook, WebhookVerificationSchema } from "./verify.js";
 
 export const WebhookSourceConfigSchema = z
   .object({
@@ -17,6 +24,11 @@ export const WebhookSourceConfigSchema = z
     mode: z.enum(["smee", "listen"]).default("smee"),
     smeeUrl: z.string().optional(),
     verification: WebhookVerificationSchema,
+    /** Linear viewer/app user id pinned during OAuth setup for privileged AgentSession events. */
+    linearAppUserId: z.string().trim().min(1).optional(),
+    /** Dedicated Chip user and organization pinned from the project environment API key. */
+    linearUserId: z.string().trim().min(1).optional(),
+    linearOrganizationId: z.string().trim().min(1).optional(),
     mapping: WebhookMappingSchema.optional(),
     /** While > 0, incoming raw payloads are stored for mapping authoring. */
     captureRemaining: z.number().int().min(0).default(0),
@@ -168,6 +180,11 @@ export class WebhookIngestSource implements Source {
       return { status: 400, message: "body is not valid JSON" };
     }
 
+    if (this.config.name.toLowerCase() === "linear" && !isFreshLinearWebhook(body)) {
+      this.rejected++;
+      return { status: 401, message: "Linear webhook timestamp is stale or missing" };
+    }
+
     if (this.captureRemaining > 0) {
       this.captureRemaining--;
       this.captured++;
@@ -179,15 +196,47 @@ export class WebhookIngestSource implements Source {
       );
     }
 
-    const event = mapWebhookEvent({
-      provider: this.config.name,
-      mapping: this.config.mapping,
-      body,
-      rawBody,
-      headerDeliveryId: this.config.mapping?.deliveryIdHeader
-        ? getHeader(this.config.mapping.deliveryIdHeader)
-        : undefined,
-    });
+    let privilegedLinearEvent = null;
+    if (this.config.name.toLowerCase() === "linear") {
+      try {
+        privilegedLinearEvent = linearAgentSessionToWakeEvent({
+          body,
+          sourceId: this.id,
+          expectedAppUserId: this.config.linearAppUserId,
+          signedBodyDeliveryId: signedBodyDeliveryId("linear", rawBody),
+        });
+        privilegedLinearEvent ??= linearUserEventToWakeEvent({
+          body,
+          sourceId: this.id,
+          expectedUserId: this.config.linearUserId,
+          expectedOrganizationId: this.config.linearOrganizationId,
+          signedBodyDeliveryId: signedBodyDeliveryId("linear", rawBody),
+        });
+      } catch (error) {
+        if (
+          error instanceof InvalidLinearAgentSessionEventError ||
+          error instanceof InvalidLinearUserEventError
+        ) {
+          this.rejected++;
+          return { status: 400, message: error.message };
+        }
+        throw error;
+      }
+    }
+    const event =
+      privilegedLinearEvent ??
+      normalizeLinearAgentEvent({
+        ...mapWebhookEvent({
+          provider: this.config.name,
+          mapping: this.config.mapping,
+          body,
+          rawBody,
+          headerDeliveryId: this.config.mapping?.deliveryIdHeader
+            ? getHeader(this.config.mapping.deliveryIdHeader)
+            : undefined,
+        }),
+        sourceId: this.id,
+      });
     this.received++;
     this.lastEventAt = new Date().toISOString();
     this.ctx.emit(event);

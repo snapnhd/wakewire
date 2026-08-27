@@ -50,6 +50,17 @@ export function verifyWebhook(
   return timingSafeEqual(presented, expected);
 }
 
+/** Linear recommends rejecting signed deliveries outside a one-minute window. */
+export function isFreshLinearWebhook(
+  body: Record<string, unknown>,
+  nowMs: number = Date.now(),
+): boolean {
+  const value = body.webhookTimestamp;
+  const timestamp =
+    typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+  return Number.isFinite(timestamp) && Math.abs(nowMs - timestamp) <= 60_000;
+}
+
 function timingSafeEqual(a: string, b: string): boolean {
   const bufA = Buffer.from(a);
   const bufB = Buffer.from(b);

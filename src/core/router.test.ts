@@ -111,17 +111,18 @@ describe("matchRoutes — slack", () => {
     };
   }
 
-  it("matches app_mention routes across channels by default", () => {
+  it("matches explicitly selected app_mention routes across channels", () => {
     const r = route({ source: "slack", match: { events: ["app_mention"] } });
     expect(matchRoutes([r], slackEvent({}))).toHaveLength(1);
     expect(matchRoutes([r], slackEvent({ kind: "message" }))).toHaveLength(0);
   });
 
-  it("tolerates stored routes whose match lacks events (pre-normalization rows)", () => {
+  it("fails closed for stored Slack routes whose match lacks events", () => {
     const legacySlack = route({ source: "slack", match: {} as never });
     expect(() => matchRoutes([legacySlack], slackEvent({}))).not.toThrow();
-    expect(matchRoutes([legacySlack], slackEvent({}))).toHaveLength(1); // defaults to app_mention
+    expect(matchRoutes([legacySlack], slackEvent({}))).toHaveLength(0);
 
+    // GitHub retains its documented push default for pre-normalization rows.
     const legacyGithub = route({ match: { repo: "acme/api" } as never });
     expect(() =>
       matchRoutes([legacyGithub], githubEvent({ payload: { repo: "acme/api", branch: "main" } })),

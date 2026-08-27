@@ -13,7 +13,7 @@ describe("RouteInputSchema", () => {
     expect(route.enabled).toBe(true);
   });
 
-  it("persists match defaults into the parsed route (regression: default routes lost events)", () => {
+  it("persists github match defaults into the parsed route", () => {
     // github: events defaults to ["push"]
     const github = RouteInputSchema.parse({
       name: "gh",
@@ -22,15 +22,6 @@ describe("RouteInputSchema", () => {
       target: { type: "thread", threadId: "t-1" },
     });
     expect(github.match).toEqual({ repo: "acme/api", events: ["push"] });
-
-    // slack: events defaults to ["app_mention"]
-    const slack = RouteInputSchema.parse({
-      name: "mentions",
-      source: "slack",
-      match: {},
-      target: { type: "thread", threadId: "t-1" },
-    });
-    expect(slack.match).toEqual({ events: ["app_mention"] });
   });
 
   it("rejects malformed repo matchers", () => {
@@ -86,14 +77,23 @@ describe("RouteInputSchema", () => {
     expect(result.data?.target).toEqual({ type: "new-thread", cwd: "/repos/api", worktree: true });
   });
 
-  it("slack: message routes require channels; mention-only routes do not", () => {
-    const mentionOnly = RouteInputSchema.safeParse({
+  it("slack: events are explicit and message routes require channels", () => {
+    const missingEvents = RouteInputSchema.safeParse({
       name: "mentions",
       source: "slack",
       match: {},
       target: { type: "thread", threadId: "t-1" },
     });
-    expect(mentionOnly.success).toBe(true); // events defaults to ["app_mention"]
+    expect(missingEvents.success).toBe(false);
+    expect(JSON.stringify(missingEvents.error?.issues)).toContain("events");
+
+    const mentionOnly = RouteInputSchema.safeParse({
+      name: "mentions",
+      source: "slack",
+      match: { events: ["app_mention"] },
+      target: { type: "thread", threadId: "t-1" },
+    });
+    expect(mentionOnly.success).toBe(true);
 
     const allMessages = RouteInputSchema.safeParse({
       name: "everything",

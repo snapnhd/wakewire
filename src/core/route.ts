@@ -17,14 +17,14 @@ export const SlackMatchSchema = z
   .object({
     /**
      * Channel ids (C…) or names (with or without "#"). Required when matching
-     * plain messages — mention-only routes may span all channels the bot is in.
+     * message events. Other explicitly selected event types may omit channels.
      */
     channels: z.array(z.string().min(1)).min(1).optional(),
     /**
-     * Slack event types: "app_mention" (default), "message",
+     * Explicit Slack event types, such as "app_mention", "message",
      * "message.<subtype>", "reaction_added". Bare "message" matches all subtypes.
      */
-    events: z.array(z.string().min(1)).min(1).default(["app_mention"]),
+    events: z.array(z.string().min(1)).min(1),
     /**
      * Filter on the sender: a Slack user id (U…, stable) or an exact
      * case-insensitive display name. Names are mutable and non-unique — use an
@@ -135,9 +135,9 @@ export const RouteInputSchema = z
     }
   })
   .transform((route) => {
-    // Persist the PARSED match so schema defaults (github events: ["push"],
-    // slack events: ["app_mention"]) reach the router — storing the raw input
-    // dropped them and made the router throw on default routes.
+    // Persist the PARSED match so schema defaults (currently GitHub's
+    // events: ["push"]) reach the router. Slack events are intentionally
+    // explicit so a route cannot silently inherit bot-oriented behavior.
     const parsed = matchSchemaFor(route.source).safeParse(route.match);
     return {
       ...route,

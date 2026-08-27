@@ -1,6 +1,8 @@
 node_modules/
 dist/
+desktop-bridge/.build/
 coverage/
+.env.local
 *.log
 .DS_Store
 *.tsbuildinfo

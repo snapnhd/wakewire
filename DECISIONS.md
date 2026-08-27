@@ -132,16 +132,25 @@ skills, mcp, config-reference).
     durably queued"); anything that fails before that stays un-acked, Slack
     redelivers with the same `event_id`, and dedup collapses the retry. Events
     we deliberately skip (bot chatter, non-events envelopes) are acked
-    immediately. Name resolution runs inside the ack window — cached, and an
-    occasional blown ~3s deadline just causes a deduped redelivery. The
-    bot token is only used to resolve channel/user names (cached, best-effort;
-    unresolved names fall back to raw ids so templates always render).
-    Guardrails: `message` routes must name channels, mention-only routes may
-    span the bot's channels, bot-authored messages are skipped by default, and
-    slack routes get github-like sandbox rules (default read-only, opt-in
-    write) — see SECURITY.md for the reasoning. Migration 3 rebuilds the routes
+    immediately. The ack window uses cached names only; cache misses are warmed
+    asynchronously after durable enqueue and acknowledgment, so optional Slack
+    API lookups never delay transport acknowledgment. Unresolved names fall back
+    to raw ids so templates always render. Guardrails: `message` routes must name channels,
+    bot-authored messages are skipped by default, and Slack routes get
+    github-like sandbox rules (default read-only, opt-in write) — see
+    SECURITY.md for the reasoning. Migration 3 rebuilds the routes
     and sources tables to drop the `kind` CHECK constraints: extensible enums
     belong in zod at the boundary, not baked into SQLite DDL.
+    Reworked 2026-07-28 for Snap: Chip already has one full normal Slack account,
+    so the source must not create a bot or second Chip identity. Socket Mode
+    uses `xapp-…`; event visibility and reactions use Chip's `xoxp-…` token.
+    `message.im`, `message.mpim`, `message.channels`, and optional
+    `message.groups` are user events. The xapp and xoxp tokens are validated as one immutable Slack app,
+    and every envelope must match that app plus the pinned non-bot Chip authorization;
+    one-to-one PMs require `channel_type: "im"`; channel and group-PM requests
+    require Slack's exact `<@CHIP_USER_ID>` encoding. The sender's immutable identity is still
+    checked separately against enrollment. Self events, edits, bot messages,
+    and unmentioned MPIM chatter fail closed.
 14. **Generic webhook source (added 2026-07-03).** Provider-specific code
     collapsed into two declarative pieces: a verification preset (hmac-sha256
     over the raw body with configurable header/prefix/encoding, or a
@@ -184,6 +193,53 @@ skills, mcp, config-reference).
     codex-sdk`). `sink.appServerListen` stays opt-in: on by default would open
     an unauthenticated loopback codex control plane without consent.
 
+18. **Per-request execution profiles and parent-coordinated child tasks
+    (2026-07-30).** Authenticated request text is parsed once at ingress into a
+    durable closed profile. Luna/low is passed explicitly on ordinary turns;
+    recognized overrides cannot remain sticky, and standalone `Ultracode` maps
+    to Sol/ultra. Desktop's existing-task follower IPC supports exact model and
+    effort, but its new-task deep link accepts only prompt/path metadata. Rather
+    than race global configuration or manipulate brittle model pickers, an
+    explicit separate-task request (and a first-task non-default override) uses
+    host-owned orchestration. App-server `thread/start` prepares empty parent
+    and child tasks with deterministic `threadSource` recovery, exact cwd, and
+    frozen profiles; Desktop IPC then starts the child work with the requested
+    model/effort. SQLite persists the child stage, ID, turn marker, and final
+    result before WakeWire appends one idempotent parent report turn. Only that
+    parent turn owns the original completion/provider outbox binding. The child
+    repeats the full safety envelope, has no direct source-reply authority, and
+    an authenticated stop interrupts both parent and child IDs.
+
+19. **Recurring Slack reports use an origin-bound WakeWire outbox
+    (2026-07-30).** A scheduled task must not call the bundled ChatGPT Slack
+    connector for its report: that path allows model-selected routing and can
+    append connector-controlled product attribution even when the submitted
+    body has no footer. Registration instead accepts only an existing automation
+    ID, an authenticated Slack origin request, and the exact current Codex task.
+    WakeWire freezes the origin source/workspace/channel plus its task, turn, and
+    correlation marker and exposes only an opaque delivery ID. Per run, a stable
+    logical occurrence key and normalized body create one provider-only request
+    and source-reply outbox job. An identical replay reuses them; conflicting
+    content for the same key fails closed. The existing pinned Chip user-token
+    responder posts a top-level message and reconciles uncertain delivery without
+    turning it into a thread reply. This is intentionally separate from the
+    one-shot follow-up binding: recurring reports remain active after each
+    accepted occurrence, while terminal monitors pause after their one result.
+
+20. **Desktop first turns retain a hardened interactive submission boundary
+    (2026-07-31).** A prefilled new-chat composer is not proof of submission,
+    and AppKit's frontmost-application observation can remain stale even after
+    macOS has activated Desktop. The helper therefore verifies focus through
+    Accessibility and separates a retryable v2 draft intent from an exclusive
+    Send-attempt sidecar written immediately before AXPress or mouseDown. A
+    pre-Send failure can retry; once the sidecar exists, every recovery is
+    read-only. Legacy v1 intents also remain read-only because their send phase
+    cannot be proven. We tested app-server empty-task preparation as a possible
+    background replacement and rejected it: the task is transient, is not owned
+    by Desktop's renderer, and follower IPC returns `no-client-found`. Desktop
+    new-task work therefore queues while macOS is locked; use a non-Desktop
+    adapter when true background execution is required.
+
 ## Deliberately deferred
 
 ### GitHub IP allowlist on listen-mode ingress (backlog, 2026-07-05)
@@ -225,15 +281,28 @@ marginally better (cleartext on the mail server, quoted into replies, forwarded,
 indexed, captured to disk here). A bearer secret anywhere in an email leaks into
 many persistent places — a weak design.
 
-**How we would enable it, when revisited.** Authenticate the sender instead of
-carrying a secret: Gmail runs DKIM/DMARC and stamps `Authentication-Results` on
-delivery, and since we read straight from Gmail's IMAP we can trust that header —
-verifying "really came from this domain, not forged" with no shared secret to
-leak. Then write-capable email becomes a legitimate, informed opt-in on the same
-footing as Slack/GitHub. Alternatively, keep email read-only for triage and route
-*actions* through channels that authenticate their sender by construction (a Slack
-DM to the bot, a signed webhook from a Shortcut) — use the right medium for the
-trust level.
+**How the Snap fork opted in, and the remaining boundary.** The Chip dispatcher
+trusts only Gmail's topmost aligned `dmarc=pass` Authentication-Results verdict
+and an explicitly enrolled From alias. This prevents ordinary cross-domain From
+spoofing without putting a bearer secret in mail, but DMARC authenticates the
+domain, not the individual local-part. Another authorized system that can emit
+aligned mail as the enrolled address can still impersonate that owner. The fork
+therefore documents email owner dispatch as explicit trust in the mail domain's
+account/outbound-sender controls. A per-person S/MIME/PGP signature or an
+approval challenge is still required where that operational assumption is too
+weak. Otherwise keep email read-only for triage and route actions through Slack
+or a signed webhook.
+
+**Why the ChatGPT/Codex Gmail app is not the verifier.** The app can establish
+that a message exists in an OAuth-connected mailbox and expose its MIME data,
+but that is the same received artifact WakeWire already has. It does not prove
+which human controlled the From local-part. The Desktop connection is not
+available as a reusable local-daemon token; OpenAI's API connector requires the
+application to run its own OAuth flow and supply an access token. Putting a
+model between receipt and authorization would also turn prompt-controlled text
+into part of the auth decision. If local-part proof is required, use the Gmail
+API directly: OAuth-connect each enrolled sender account and require the exact
+RFC Message-ID under that account's `SENT` label, or require S/MIME/PGP.
 
 Related hardening still open (see the security-review round): make sandbox
 network-off explicit and identical across all three adapters (today only the

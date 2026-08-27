@@ -11,32 +11,278 @@ export function trimGithubEvent(args: {
   eventName: string;
   deliveryId: string;
   payload: Record<string, unknown>;
+  sourceId?: string | undefined;
 }): WakeEvent | null {
-  const { eventName, deliveryId, payload } = args;
+  const { eventName, deliveryId, payload, sourceId } = args;
   const repo = repoFullName(payload);
   if (!repo) return null; // ping and other repo-less events are not routable
   const action = typeof payload.action === "string" ? payload.action : undefined;
   const kind = action ? `${eventName}.${action}` : eventName;
   const occurredAt = new Date().toISOString();
 
+  let event: WakeEvent;
   if (eventName === "push") {
-    return trimPush({ repo, deliveryId, occurredAt, payload });
+    event = trimPush({ repo, deliveryId, occurredAt, payload });
+  } else if (eventName === "pull_request") {
+    event = trimPullRequest({ repo, kind, action, deliveryId, occurredAt, payload });
+  } else if (eventName === "issues") {
+    event = trimIssue({ repo, kind, action, deliveryId, occurredAt, payload });
+  } else if (eventName === "issue_comment") {
+    event = trimIssueComment({ repo, kind, action, deliveryId, occurredAt, payload });
+  } else if (eventName === "pull_request_review_comment") {
+    event = trimReviewComment({ repo, kind, action, deliveryId, occurredAt, payload });
+  } else if (eventName === "pull_request_review") {
+    event = trimPullRequestReview({ repo, kind, action, deliveryId, occurredAt, payload });
+  } else {
+    // Generic fallback: minimal, still routable by repo + event name.
+    event = {
+      source: "github",
+      kind,
+      deliveryId,
+      occurredAt,
+      summary: `${kind} event on ${repo}`,
+      payload: { repo, ...(action ? { action } : {}) },
+    };
   }
-  if (eventName === "pull_request") {
-    return trimPullRequest({ repo, kind, action, deliveryId, occurredAt, payload });
-  }
-  if (eventName === "issues") {
-    return trimIssue({ repo, kind, action, deliveryId, occurredAt, payload });
-  }
-  // Generic fallback: minimal, still routable by repo + event name.
+  return addGithubContext(event, payload, sourceId);
+}
+
+function trimIssueComment(args: {
+  repo: string;
+  kind: string;
+  action: string | undefined;
+  deliveryId: string;
+  occurredAt: string;
+  payload: Record<string, unknown>;
+}): WakeEvent {
+  const { repo, kind, action, deliveryId, occurredAt, payload } = args;
+  const issue = isRecord(payload.issue) ? payload.issue : {};
+  const comment = isRecord(payload.comment) ? payload.comment : {};
+  const number = numberOf(issue.number);
+  const body = truncate(stringOf(comment.body), 4_000);
+  const title = truncate(stringOf(issue.title), 200);
+  const isPullRequest = isRecord(issue.pull_request);
+  const author = isRecord(issue.user) ? stringOf(issue.user.login) : "";
   return {
     source: "github",
     kind,
     deliveryId,
     occurredAt,
-    summary: `${kind} event on ${repo}`,
-    payload: { repo, ...(action ? { action } : {}) },
+    summary: `Comment ${action ?? ""} on ${repo}#${number ?? "?"}: ${title}`.trim(),
+    payload: {
+      repo,
+      ...(action ? { action } : {}),
+      number: number ?? null,
+      title,
+      body,
+      commentId: numberOf(comment.id) ?? null,
+      url: stringOf(comment.html_url),
+      issueUrl: stringOf(issue.html_url),
+      isPullRequest,
+      ...(isPullRequest && author ? { pullRequestAuthorLogin: author } : {}),
+    },
   };
+}
+
+function trimReviewComment(args: {
+  repo: string;
+  kind: string;
+  action: string | undefined;
+  deliveryId: string;
+  occurredAt: string;
+  payload: Record<string, unknown>;
+}): WakeEvent {
+  const { repo, kind, action, deliveryId, occurredAt, payload } = args;
+  const pr = isRecord(payload.pull_request) ? payload.pull_request : {};
+  const comment = isRecord(payload.comment) ? payload.comment : {};
+  const number = numberOf(payload.number) ?? numberOf(pr.number);
+  const title = truncate(stringOf(pr.title), 200);
+  const author = isRecord(pr.user) ? stringOf(pr.user.login) : "";
+  return {
+    source: "github",
+    kind,
+    deliveryId,
+    occurredAt,
+    summary: `Review comment ${action ?? ""} on ${repo}#${number ?? "?"}: ${title}`.trim(),
+    payload: {
+      repo,
+      ...(action ? { action } : {}),
+      number: number ?? null,
+      title,
+      body: truncate(stringOf(comment.body), 4_000),
+      commentId: numberOf(comment.id) ?? null,
+      url: stringOf(comment.html_url),
+      pullRequestUrl: stringOf(pr.html_url),
+      branch: isRecord(pr.head) && typeof pr.head.ref === "string" ? pr.head.ref : "",
+      isPullRequest: true,
+      ...(author ? { pullRequestAuthorLogin: author } : {}),
+    },
+  };
+}
+
+function trimPullRequestReview(args: {
+  repo: string;
+  kind: string;
+  action: string | undefined;
+  deliveryId: string;
+  occurredAt: string;
+  payload: Record<string, unknown>;
+}): WakeEvent {
+  const { repo, kind, action, deliveryId, occurredAt, payload } = args;
+  const pr = isRecord(payload.pull_request) ? payload.pull_request : {};
+  const review = isRecord(payload.review) ? payload.review : {};
+  const number = numberOf(payload.number) ?? numberOf(pr.number);
+  const title = truncate(stringOf(pr.title), 200);
+  const author = isRecord(pr.user) ? stringOf(pr.user.login) : "";
+  return {
+    source: "github",
+    kind,
+    deliveryId,
+    occurredAt,
+    summary: `Review ${action ?? ""} on ${repo}#${number ?? "?"}: ${title}`.trim(),
+    payload: {
+      repo,
+      ...(action ? { action } : {}),
+      number: number ?? null,
+      title,
+      body: truncate(stringOf(review.body), 4_000),
+      reviewId: numberOf(review.id) ?? null,
+      url: stringOf(review.html_url),
+      pullRequestUrl: stringOf(pr.html_url),
+      branch: isRecord(pr.head) && typeof pr.head.ref === "string" ? pr.head.ref : "",
+      isPullRequest: true,
+      ...(author ? { pullRequestAuthorLogin: author } : {}),
+    },
+  };
+}
+
+function addGithubContext(
+  event: WakeEvent,
+  raw: Record<string, unknown>,
+  sourceId: string | undefined,
+): WakeEvent {
+  const repository = isRecord(raw.repository) ? raw.repository : {};
+  const sender = isRecord(raw.sender) ? raw.sender : {};
+  const repoId = numberOf(repository.id);
+  const senderId = numberOf(sender.id);
+  const senderLogin = stringOf(sender.login);
+  const senderType = stringOf(sender.type);
+  const senderIsUser = senderType === "User";
+  const number = numberOf(event.payload.number);
+  const commentId = numberOf(event.payload.commentId);
+  const relevantText = senderIsUser ? githubSenderAuthoredText(event, raw, senderId) : "";
+  const mentions = extractGithubMentions(relevantText);
+  const senderAuthoredFeedback = isGithubFeedbackEvent(event) && relevantText.trim().length > 0;
+  const requestedReviewer = senderIsUser ? githubRequestedReviewerTarget(event, raw) : undefined;
+  if (requestedReviewer && !mentions.some(({ value }) => value === requestedReviewer)) {
+    mentions.push({ kind: "handle", value: requestedReviewer });
+  }
+  const repoScope = repoId === undefined ? String(event.payload.repo) : String(repoId);
+  const rootKey = number === undefined ? undefined : `${repoScope}:${number}`;
+  const nativeKey =
+    commentId === undefined ? rootKey : `${rootKey ?? repoScope}:comment:${commentId}`;
+  return {
+    ...event,
+    ...(sourceId ? { sourceId } : {}),
+    payload: {
+      ...event.payload,
+      ...(repoId === undefined ? {} : { repositoryId: repoId }),
+      ...(senderId === undefined ? {} : { senderId }),
+      ...(senderLogin ? { senderLogin } : {}),
+      ...(senderType ? { senderType } : {}),
+      ...(senderAuthoredFeedback ? { senderAuthoredFeedback: true } : {}),
+    },
+    ...(senderId === undefined
+      ? {}
+      : {
+          principal: {
+            provider: "github" as const,
+            tenantId: "github.com",
+            subjectId: String(senderId),
+            ...(senderLogin ? { handle: senderLogin, displayName: senderLogin } : {}),
+          },
+        }),
+    ...(nativeKey
+      ? {
+          conversation: {
+            nativeKey,
+            ...(rootKey ? { rootKey } : {}),
+            replyTarget:
+              commentId === undefined
+                ? `${repoScope}:${number ?? "repo"}`
+                : `${repoScope}:comment:${commentId}`,
+          },
+        }
+      : {}),
+    ...(mentions.length > 0 ? { targetMentions: mentions } : {}),
+  };
+}
+
+/**
+ * GitHub's top-level sender is the actor for the webhook action, not
+ * necessarily the author of the issue/comment text included in that payload.
+ * Only newly-created text whose immutable author id equals sender may address
+ * Chip. This prevents CJ closing/labeling another person's issue from turning
+ * that person's old @chip text into a CJ-authenticated command.
+ */
+function githubSenderAuthoredText(
+  event: WakeEvent,
+  raw: Record<string, unknown>,
+  senderId: number | undefined,
+): string {
+  if (senderId === undefined) return "";
+  let authored: Record<string, unknown> = {};
+  if (event.kind === "issue_comment.created") {
+    authored = isRecord(raw.comment) ? raw.comment : {};
+  } else if (event.kind === "pull_request_review_comment.created") {
+    authored = isRecord(raw.comment) ? raw.comment : {};
+  } else if (event.kind === "pull_request_review.submitted") {
+    authored = isRecord(raw.review) ? raw.review : {};
+  } else if (event.kind === "issues.opened") {
+    authored = isRecord(raw.issue) ? raw.issue : {};
+  } else if (event.kind === "pull_request.opened") {
+    authored = isRecord(raw.pull_request) ? raw.pull_request : {};
+  } else {
+    return "";
+  }
+  const author = isRecord(authored.user) ? authored.user : {};
+  if (numberOf(author.id) !== senderId || stringOf(author.type) !== "User") return "";
+  return [authored.title, authored.body]
+    .filter((value): value is string => typeof value === "string")
+    .join("\n");
+}
+
+function isGithubFeedbackEvent(event: WakeEvent): boolean {
+  return (
+    event.kind === "issue_comment.created" ||
+    event.kind === "pull_request_review_comment.created" ||
+    event.kind === "pull_request_review.submitted"
+  );
+}
+
+function extractGithubMentions(text: string): Array<{ kind: "handle"; value: string }> {
+  const values = new Set<string>();
+  for (const match of text.matchAll(/(^|[^@\w])@([a-z\d](?:[a-z\d-]{0,38}))(?![\w-])/gi)) {
+    const value = match[2];
+    if (value) values.add(value.toLowerCase());
+  }
+  return [...values].map((value) => ({ kind: "handle", value }));
+}
+
+/**
+ * A review request is newly-authored structured intent in the signed webhook.
+ * Use only the action's singular user field. The PR body/reviewer arrays are
+ * older state, and requested_team is excluded because this is a user identity.
+ * Whether the normalized reviewer is Chip is decided centrally by targeting.
+ */
+function githubRequestedReviewerTarget(
+  event: WakeEvent,
+  raw: Record<string, unknown>,
+): string | undefined {
+  if (event.kind !== "pull_request.review_requested") return undefined;
+  const reviewer = isRecord(raw.requested_reviewer) ? raw.requested_reviewer : {};
+  const login = stringOf(reviewer.login).trim().toLowerCase();
+  return login || undefined;
 }
 
 function trimPush(args: {
@@ -107,6 +353,7 @@ function trimPullRequest(args: {
   const url = typeof pr.html_url === "string" ? pr.html_url : "";
   const headBranch = isRecord(pr.head) && typeof pr.head.ref === "string" ? pr.head.ref : "";
   const baseBranch = isRecord(pr.base) && typeof pr.base.ref === "string" ? pr.base.ref : "";
+  const body = truncate(typeof pr.body === "string" ? pr.body : "", 1000);
   return {
     source: "github",
     kind,
@@ -122,7 +369,9 @@ function trimPullRequest(args: {
       url,
       branch: headBranch,
       baseBranch,
-      body: truncate(typeof pr.body === "string" ? pr.body : "", 1000),
+      // A review_requested action is the command. Keep the older PR body only
+      // as provider context so requestText cannot promote it to the command.
+      ...(action === "review_requested" ? { pullRequestBody: body } : { body }),
     },
   };
 }
@@ -174,6 +423,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function arrayLength(value: unknown): number {
   return Array.isArray(value) ? value.length : 0;
+}
+
+function stringOf(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function numberOf(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function truncate(text: string, limit: number): string {

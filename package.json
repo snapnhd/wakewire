@@ -27,6 +27,7 @@
   "types": "dist/index.d.ts",
   "files": [
     "dist",
+    "desktop-bridge",
     "plugin",
     "recipes",
     "docs",
@@ -81,10 +82,10 @@
   "author": "Glenn Calleja Frendo",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/glenncalleja/wakewire.git"
+    "url": "git+https://github.com/snapnhd/wakewire.git"
   },
-  "homepage": "https://github.com/glenncalleja/wakewire#readme",
+  "homepage": "https://github.com/snapnhd/wakewire#readme",
   "bugs": {
-    "url": "https://github.com/glenncalleja/wakewire/issues"
+    "url": "https://github.com/snapnhd/wakewire/issues"
   }
 }

@@ -17,11 +17,14 @@ wakewire status                # expect adapter.codexReachable: true
 Install the Codex plugin:
 
 ```bash
-codex plugin marketplace add https://github.com/glenncalleja/wakewire   # or a local checkout path
+codex plugin marketplace add https://github.com/snapnhd/wakewire   # or a local checkout path
 ```
 
 then in a `codex` CLI session run `/plugins`, install **WakeWire**, and restart.
 (Desktop app: the Plugins screen in settings.)
+
+For Snap's authenticated multi-provider Chip dispatcher, continue with
+[chip-dispatcher.md](chip-dispatcher.md) before starting the daemon.
 
 **Quick sanity check** — paste into any Codex conversation:
 

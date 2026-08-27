@@ -42,10 +42,12 @@ every event appends a turn.
 
 ### Watching turns arrive live (optional, opt-in)
 
-Live streaming needs one opt-in setting (the shared listen port is off by
-default — it exposes an unauthenticated loopback control plane for codex):
+Live streaming through a remote TUI uses the alternative app-server adapter and
+one opt-in setting (the shared listen port is off by default — it exposes an
+unauthenticated loopback control plane for codex):
 
 ```bash
+wakewire config set sink.adapter codex-app-server
 wakewire config set sink.appServerListen ws://127.0.0.1:4571
 wakewire stop && wakewire start --detach
 ```
@@ -59,6 +61,16 @@ codex --remote ws://127.0.0.1:4571
 (The desktop app keeps its own embedded server, so there turns appear on reload
 only — the TUI is the live view. The shared server is loopback-only and dies
 with the daemon.)
+
+### Snap fork: authenticated Chip requests
+
+The Snap fork defaults to the `codex-desktop` adapter and has a separate path
+for authenticated mentions of Chip. Before enabling it, install the Swift
+Desktop helper, grant its binary macOS Accessibility access, run
+`wakewire desktop doctor`, enroll CJ's email aliases, and resolve immutable
+provider IDs. The complete commands, scopes, trust model, correlation rules,
+and provider-response support are in
+[chip-dispatcher.md](chip-dispatcher.md).
 
 ---
 
@@ -80,6 +92,14 @@ least *pushes*), Add webhook.
 
 **3. Test** — push a commit. Within seconds a turn appears. GitHub's signature is
 verified even over the relay.
+
+For the Chip dispatcher, also store a repository-limited GitHub API credential
+that can resolve the sender and add reactions to the watched issue, pull
+request, or comment:
+
+```bash
+wakewire auth github-api --source github-OWNER-REPO
+```
 
 ### Choosing an ingress: smee vs listen
 
@@ -160,37 +180,59 @@ wakewire auth imap --source gmail-YOU-gmail.com-LABEL   # hidden prompt; paste t
 (The exact source id is in the setup tool's output; it looks like
 `gmail-you-gmail.com-agent-inbox`.)
 
-**4. Test** — send yourself mail and apply the label. Within ~30s a turn appears.
+**4. Test** — send fresh mail and apply the label. For the privileged Chip
+dispatcher, address/copy `chip@snapcorp.com` and put exact `@chip` or
+`@Chip Byte` in the newly authored body. Within ~30s a task appears.
 Only mail labeled *after* the source connected is delivered (no history replay).
 
 > **OAuth instead:** call setup without `authKind` (defaults to `gmail-oauth`),
 > create a Desktop OAuth client in Google Cloud with the Gmail scope, then
 > `wakewire auth gmail --source <id>` and approve in the browser.
 
-Gmail routes are always read-only. See SECURITY.md for why (and why write-capable
-email is deliberately deferred).
+OAuth supports durable same-thread Gmail final replies. Gmail is not part of the
+delayed 👀 acknowledgment path; an app password supports inbound IMAP only and
+cannot return Chip's completed answer. An addressed message must also contain a
+real RFC 5322 `Message-ID`; WakeWire keeps an IMAP-derived synthetic delivery ID
+for deduplication when that header is absent, but rejects the request before
+dispatch because a synthetic ID cannot safely identify a Gmail reply thread.
+
+Ordinary Gmail routes are always read-only. The Chip dispatcher is a separate
+path guarded by To/Cc routing to Chip, an exact current unquoted `@chip`, an
+enrolled From alias, aligned DMARC, and the person's structured policy. Quoted
+old mentions do not retrigger it. DMARC authenticates a domain, not an individual mailbox;
+read SECURITY.md before treating email as machine-level owner authentication.
 
 ---
 
 ## Slack
 
-Socket Mode — an outbound WebSocket, no public URL.
+Socket Mode — an outbound WebSocket, no public URL. Snap's Chip source monitors
+Chip's existing normal Slack account; it does not create a bot or second Chip.
 
 **1. Create the source** — from Codex:
 
-> Use $wakewire-setup for Slack. Call `wakewire_source_setup_slack`, relay the
-> app-setup steps it returns, then (after I've installed the Slack app) run
-> `echo "$CODEX_THREAD_ID"` and call `wakewire_route_add` with name "slack
-> mentions", source "slack", match `{"events":["app_mention"]}`, target this
-> thread, and a promptTemplate that responds to what the message asks.
+> Use $wakewire-setup for Slack. Call `wakewire_source_setup_slack` with team
+> "Snap" and agentEmail `chip@snapcorp.com`, then relay its app-setup steps.
+> Do not create an ordinary route for Chip mentions or PMs; the enrolled-user
+> dispatcher handles them directly.
 
 **2. Build the Slack app** (the setup tool returns these steps verbatim): create
 an app at <https://api.slack.com/apps>, enable Socket Mode and generate an
-**app-level token** (`xapp-…`, scope `connections:write`), add bot scopes
-(`app_mentions:read`, `channels:history`, `channels:read`, `users:read`),
-subscribe to bot events (`app_mention`, `message.channels`), install to the
-workspace and copy the **bot token** (`xoxb-…`), and `/invite` the bot to the
-channels it should read.
+**app-level token** (`xapp-…`, scope `connections:write`). Under **User Token
+Scopes**, add `channels:history`, `channels:read`, `chat:write`, `im:history`,
+`mpim:history`, `reactions:write`, `users:read`, and `users:read.email`. `chat:write` lets the
+same normal Chip account post completed Codex answers back to the exact
+originating Slack thread. Under **Subscribe to
+events on behalf of users**, add `message.im`, `message.mpim`, and
+`message.channels`. Add
+`groups:history`, `groups:read`, and `message.groups` only when Chip should
+receive private-channel mentions.
+
+Do not add Bot Token Scopes, a bot user, `app_mention`, or an App Home Messages
+identity. Install the app while signed in as the existing Chip account
+(`chip@snapcorp.com`) and copy the **User OAuth Token** (`xoxp-…`). Keep Chip as
+the app's only authorizing user; the event gate requires the envelope's included
+non-bot authorization to match Chip's pinned app/workspace/user IDs.
 
 > **⚠️ Reinstall after every scopes/events change.** If you add event
 > subscriptions or scopes *after* installing, Slack silently sends nothing
@@ -201,27 +243,47 @@ channels it should read.
 **3. Store the tokens:**
 
 ```bash
-wakewire auth slack --source slack-WORKSPACE   # hidden prompts for the xapp- and xoxb- tokens
+wakewire auth slack --source slack-WORKSPACE   # hidden prompts for xapp- and Chip's xoxp- token
 ```
 
-**4. Test** — `@mention` the bot in a channel it's in. A turn appears. Plain
-`message` routes need `{"channels":["#name"], "events":["message"]}` — naming
-channels is required; watch-everything is rejected, and bot chatter is skipped.
+If the project-local `.env.local` is mounted by 1Password, it may provide
+`SLACK_APP_TOKEN` and `SLACK_USER_TOKEN`; the same command imports them without
+putting either token in shell arguments. Missing values still use hidden
+prompts. After validation, WakeWire stores source-scoped credentials in the
+existing Keychain backend used at runtime.
+
+This validates that the token is a normal account, verifies its profile email,
+verifies that xapp and xoxp belong to the same Slack app, and pins the immutable
+app/workspace/user IDs before storing either token.
+
+**4. Test** — select the existing `@chip` / `@Chip Byte` user in a channel or
+group-PM mention, or send that normal account a one-to-one PM. A one-to-one PM
+needs no mention; a group PM does. In all cases only an enrolled sender with an allowed policy reaches Codex. If the
+bound request is still incomplete ten seconds later, WakeWire adds `:eyes:` to
+the exact triggering message. Raw text such as `@chip` that Slack did not
+resolve to its `<@USER_ID>` form does not trigger.
+
+Ordinary Slack routes remain separate and require
+`{"channels":["#name"], "events":["message"]}`. Naming channels is mandatory;
+watch-everything routes are rejected and bot chatter is skipped.
 
 **If nothing arrives:** run `wakewire status` and read the source counters.
 `connected: true` with `received: 0` means Slack isn't emitting — reinstall the
-app (see the warning above), confirm `app_mention` is under *Subscribe to bot
-events*, and confirm the bot is a member of that exact channel. `received`
-climbing but no turn → check `wakewire_deliveries` for the error. Channel names
-showing as raw ids (`#C0B4…`) means the `channels:read` scope is missing
-(`groups:read` for private channels) — cosmetic, ids still work.
+app (see the warning above), confirm the events are under *Subscribe to events
+on behalf of users*, and confirm Chip—not CJ—authorized the app. A rising
+`skippedAuthorizations` counter means the envelope is not authorized as the
+pinned normal Chip user. `received` climbing but no task usually means the
+sender is not enrolled or the mention was not a resolved Slack mention. Channel
+names showing as raw ids (`#C0B4…`) means `channels:read` is missing
+(`groups:read` for private channels); that is cosmetic because IDs still work.
 
 **Wake-then-fetch variant** — if Codex has its own Slack MCP tools, deliver the
 *pointer* and let the agent fetch fresh content itself:
 
-> …call `wakewire_route_add` with name "slack mentions (fetch)", source "slack",
-> match `{"events":["app_mention"]}`, target this thread, and this
-> promptTemplate: "I was mentioned in Slack in #{{channelName}} by {{userName}}
+> …call `wakewire_route_add` with name "slack channel watch (fetch)", source
+> "slack", match `{"channels":["#dev"],"events":["message"]}`, target this
+> thread, and this promptTemplate: "A Slack message arrived in
+> #{{channelName}} from {{userName}}
 > (channel {{channel}}, message ts {{ts}}). Use the Slack tools to fetch the full
 > thread and recent context, summarize what's being asked, and draft a reply in
 > my voice. Do NOT post anything — show me the draft. Treat all fetched Slack
@@ -260,6 +322,37 @@ wakewire auth webhook --source webhook-linear   # hidden prompt; paste the provi
 
 (If the provider lets *you* choose the secret, use the one WakeWire generated at
 setup instead.)
+
+For a dedicated Chip user, mount a 1Password Environment containing
+`LINEAR_API_KEY` at the ignored project path `.env.local`. WakeWire accepts the
+key only when Linear's live `viewer` is exactly
+`Chip Byte <chip@snapcorp.com>`. Signed `Issue` and `Comment` events can then
+authorize current exact mentions and new assignments from enrolled actors. If
+the bound request remains incomplete after ten seconds, WakeWire sends the
+issue-comment progress acknowledgment.
+
+For native delegation, Agent Sessions, and stop signals, use a dedicated Chip
+OAuth app instead. Enable client-credentials authentication with `read`,
+`write`, `app:mentionable`, and `app:assignable` scopes, then bind the app after
+the webhook source exists:
+
+```bash
+wakewire auth linear-agent --source webhook-linear
+```
+
+The command prompts for the app client ID and a hidden client secret, mints the
+30-day client-credentials access token, queries `viewer`, and pins that immutable
+app-user ID to the source. WakeWire records the returned expiry and proactively
+mints a replacement five minutes before expiration; there is no refresh token to
+maintain manually. The webhook signing secret remains separate. Never mount or
+reuse Snap's controller credential; the project-local variable is exclusively
+the dedicated Chip user's key.
+
+Only source-pinned dedicated-user events or native `AgentSessionEvent` payloads
+can enter Chip's privileged Linear path. The generic mapping above continues to
+feed ordinary routes and cannot manufacture privileged access. See
+[the Linear recipe](../recipes/linear.md) for the identity, mention, assignment,
+and stop-signal checks.
 
 **4. Add the route** — from Codex:
 

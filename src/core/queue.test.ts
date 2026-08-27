@@ -161,6 +161,31 @@ describe("DeliveryQueue", () => {
     expect(stores.deliveries.get(first?.id ?? "")?.status).toBe("delivered");
   });
 
+  it("awaits active deliveries during shutdown and does not wake again", async () => {
+    const first = queue.enqueueEvent(route, makeEvent("d-stop-active"));
+    adapter.block();
+    const ticking = queue.tick();
+    expect(adapter.calls).toHaveLength(1);
+
+    let stopped = false;
+    const stopping = queue.stop().then(() => {
+      stopped = true;
+    });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+
+    adapter.unblock();
+    await stopping;
+    await ticking;
+    expect(stores.deliveries.get(first?.id ?? "")?.status).toBe("delivered");
+
+    const afterStop = queue.enqueueEvent(route, makeEvent("d-stop-later"));
+    queue.wake();
+    await Promise.resolve();
+    expect(adapter.calls).toHaveLength(1);
+    expect(stores.deliveries.get(afterStop?.id ?? "")?.status).toBe("queued");
+  });
+
   it("holds and retries with backoff on BusyError, forever", async () => {
     adapter.failWith = new BusyError("turn in flight");
     adapter.failTimes = Number.MAX_SAFE_INTEGER;

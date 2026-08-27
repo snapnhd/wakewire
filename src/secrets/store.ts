@@ -108,11 +108,19 @@ export async function createSecretStore(logger: Logger): Promise<SecretStore> {
 /** Well-known secret names. */
 export const secretNames = {
   githubWebhookSecret: (sourceId: string) => `github:${sourceId}:webhook-secret`,
+  githubApiToken: (sourceId: string) => `github:${sourceId}:api-token`,
   gmailClientId: (sourceId: string) => `gmail:${sourceId}:client-id`,
   gmailClientSecret: (sourceId: string) => `gmail:${sourceId}:client-secret`,
   gmailRefreshToken: (sourceId: string) => `gmail:${sourceId}:refresh-token`,
   imapPassword: (sourceId: string) => `imap:${sourceId}:password`,
   slackAppToken: (sourceId: string) => `slack:${sourceId}:app-token`,
+  slackUserToken: (sourceId: string) => `slack:${sourceId}:user-token`,
+  /** Legacy bot-token name retained only for cleanup/migration. */
   slackBotToken: (sourceId: string) => `slack:${sourceId}:bot-token`,
+  /** Dedicated Linear OAuth/app token; never the Snap controller's LINEAR_API_KEY. */
+  linearAgentToken: (sourceId: string) => `linear:${sourceId}:agent-token`,
+  linearAgentTokenExpiresAt: (sourceId: string) => `linear:${sourceId}:agent-token-expires-at`,
+  linearAgentClientId: (sourceId: string) => `linear:${sourceId}:agent-client-id`,
+  linearAgentClientSecret: (sourceId: string) => `linear:${sourceId}:agent-client-secret`,
   webhookSecret: (sourceId: string) => `webhook:${sourceId}:secret`,
 } as const;

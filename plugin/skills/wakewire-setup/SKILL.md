@@ -35,16 +35,16 @@ If the user prefers fresh threads per event (e.g. "spawn a worktree and investig
 3. GitHub sends a `ping` on creation; `wakewire_status` should show the source received it.
 
 ### Gmail
-1. Ask which Gmail label to watch (never watch everything — a label is required) and the Gmail address.
+1. Ask which Gmail mailbox/label to watch and the Gmail address. A label is required. For the privileged Chip dispatcher, use `INBOX` when every newly received email must be screened for an explicit current `@chip`; ordinary routes should use a narrow custom label.
 2. Ask which auth they prefer:
    - **App password** (simpler): call `wakewire_source_setup_gmail` with `{label, user, authKind: "imap-password"}`. The user creates an app password at https://myaccount.google.com/apppasswords (needs 2-Step Verification) and runs `wakewire auth imap` in a terminal to store it. Also works for non-Gmail IMAP servers via `host`/`port`.
-   - **OAuth**: call `wakewire_source_setup_gmail` with `{label, user}`. The user creates their own Google OAuth client (Desktop type) and runs `wakewire auth gmail` in a terminal to complete consent.
-3. Relay the returned instructions verbatim either way.
+   - **OAuth**: call `wakewire_source_setup_gmail` with `{label, user}`. The user creates their own Google OAuth client (Desktop type) and runs `wakewire auth gmail` in a terminal to complete consent. Use OAuth for the privileged Chip dispatcher because same-thread final replies require it.
+3. Relay the returned instructions verbatim either way. For Chip testing, explain that To/Cc must include `chip@snapcorp.com`, the newly authored unquoted body must contain exact `@chip` or `@Chip Byte`, and only messages arriving after the first connected watermark are delivered.
 
 ### Slack
-1. Call `wakewire_source_setup_slack` (optionally with `{team: "workspace-name"}`). It returns the one-time Slack app setup: create an app, enable Socket Mode (app-level token, `connections:write`), add bot scopes (`app_mentions:read`, `channels:history`, `channels:read`, `users:read`), subscribe to bot events (`app_mention`, `message.channels`), install, invite the bot to channels.
+1. Call `wakewire_source_setup_slack` (optionally with `{team: "workspace-name", agentEmail: "chip@snapcorp.com"}`). It returns the one-time Slack app setup for Chip's existing normal account: enable Socket Mode (app-level token, `connections:write`), add user scopes (`channels:history`, `channels:read`, `chat:write`, `im:history`, `mpim:history`, `reactions:write`, `users:read`, `users:read.email`), subscribe on behalf of users to `message.im`, `message.mpim`, and `message.channels`, then install as Chip to obtain an `xoxp-…` user token. `chat:write` returns final Codex answers to the originating Slack thread. Do not create a bot user or App Home identity.
 2. Relay those steps verbatim, then have the user run `wakewire auth slack` in a terminal — both tokens go in via hidden prompts, never through this conversation.
-3. Slack routes match `app_mention` by default (any channel the bot is in); matching plain `message` events requires naming channels. Bot-posted messages are skipped by default.
+3. A resolved `<@CHIP_USER_ID>` mention (including in a group PM) or one-to-one PM to the existing Chip account bypasses ordinary routes and enters the dispatcher only for an enrolled Slack sender. One-to-one PMs need no mention; group PMs do. Ordinary channel `message` routes require naming channels. Bot-posted messages are skipped by default.
 
 ### Any other provider (Sentry, Grafana, Linear, ClickUp, Stripe, CI, custom)
 Use the generic webhook source. The loop:
