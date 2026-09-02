@@ -228,6 +228,9 @@ export class AgentCoordinator {
       !maintainedPrFeedback &&
       !hasChipGithubMention(event, this.chip);
     const debounceFeedback = maintainedPrFeedback || unmentionedThreadReply;
+    const debounceHeadMove =
+      event.source === "github" && event.kind === "pull_request.synchronize";
+    const debounceRequest = debounceFeedback || debounceHeadMove;
     const acceptedAt = this.now();
     let ackSpec: ReturnType<typeof buildAckSpec>;
     try {
@@ -255,7 +258,7 @@ export class AgentCoordinator {
     const progressAckNotBefore = delayedProgressAck
       ? new Date(acceptedAt.getTime() + this.progressAckDelayMs).toISOString()
       : undefined;
-    const requestNotBefore = debounceFeedback
+    const requestNotBefore = debounceRequest
       ? new Date(acceptedAt.getTime() + MAINTAINED_PR_FEEDBACK_DEBOUNCE_MS).toISOString()
       : undefined;
     const accepted = this.requests.accept({
@@ -266,11 +269,13 @@ export class AgentCoordinator {
       requestText: text,
       executionProfile,
       dedup: requestDedupKey(event),
-      ...(debounceFeedback
+      ...(debounceRequest
         ? {
-            coalesceKey: maintainedPrFeedback
-              ? maintainedPrFeedbackKey(event)
-              : reviewThreadReplyKey(event),
+            coalesceKey: debounceHeadMove
+              ? githubPrHeadMoveKey(event)
+              : maintainedPrFeedback
+                ? maintainedPrFeedbackKey(event)
+                : reviewThreadReplyKey(event),
             requestNotBefore,
           }
         : {}),
@@ -2227,6 +2232,15 @@ function githubSynchronizeHeadMoved(event: WakeEvent): boolean {
 function githubEventHeadSha(event: WakeEvent): string | null {
   const headSha = stringPayload(event, "headSha").trim().toLowerCase();
   return /^[0-9a-f]{40}$/u.test(headSha) ? headSha : null;
+}
+
+function githubPrHeadMoveKey(event: WakeEvent): string {
+  const repositoryId = identifier(event.payload.repositoryId);
+  const number = identifier(event.payload.number);
+  if (!repositoryId || !number) {
+    throw new Error("PR head move is missing repository id or PR number");
+  }
+  return `github-pr-head-move:${repositoryId}#${number}`;
 }
 
 function maintainedPrFeedbackKey(event: WakeEvent): string {

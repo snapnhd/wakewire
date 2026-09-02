@@ -483,6 +483,7 @@ function githubReviewRequestedEvent(deliveryId = "gh-rr-1"): WakeEvent {
     summary: "cswoods6 requested review from chipbyte-snap",
     payload: {
       repo: "snapnhd/system",
+      repositoryId: 981891254,
       number: 1097,
       action: "review_requested",
       author: "cswoods6",
@@ -789,6 +790,81 @@ describe("AgentCoordinator", () => {
     });
   });
 
+  it("debounces synchronize bursts per PR using the latest head", () => {
+    const db = openDatabase(":memory:");
+    const people = new PeopleStore(db);
+    const work = new WorkItemStore(db);
+    const requests = new AgentRequestStore(db);
+    let now = new Date("2026-09-02T14:00:00.000Z");
+    const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      now: () => now,
+      sinkAdapterName: "hermes",
+    });
+    const zack = people.add({ nickname: "Zack", roleName: "owner" });
+    people.attachIdentity({
+      personId: zack.id,
+      provider: "github",
+      tenantId: "github.com",
+      externalId: "17470",
+      handle: "zadams",
+    });
+    const item = work.getOrCreate({
+      kind: "github",
+      key: "github:101:pull-request:1124",
+      title: "GitHub PR snapnhd/system#1124",
+    });
+    work.attachAlias(item.id, {
+      provider: "correlation",
+      scope: "github",
+      nativeKey: "github:101:pull-request:1124",
+    });
+    const synchronize = (deliveryId: string, headSha: string): WakeEvent => ({
+      source: "github",
+      sourceId: "github-snapnhd-system",
+      kind: "pull_request.synchronize",
+      deliveryId,
+      occurredAt: now.toISOString(),
+      summary: "PR #1124 synchronized on snapnhd/system",
+      payload: {
+        repo: "snapnhd/system",
+        repositoryId: 101,
+        number: 1124,
+        isPullRequest: true,
+        author: "zadams",
+        requestedReviewerLogins: [],
+        headSha,
+      },
+      principal: {
+        provider: "github",
+        tenantId: "github.com",
+        subjectId: "17470",
+        handle: "zadams",
+      },
+      conversation: {
+        nativeKey: "101:1124",
+        rootKey: "101:1124",
+        replyTarget: "101:1124",
+      },
+    });
+    const firstHead = "1234567890abcdef1234567890abcdef12345678";
+    const latestHead = "abcdef1234567890abcdef1234567890abcdef12";
+
+    const first = coordinator.accept(synchronize("sync-burst-1", firstHead));
+    now = new Date("2026-09-02T14:00:10.000Z");
+    const latest = coordinator.accept(synchronize("sync-burst-2", latestHead));
+
+    expect(first).toMatchObject({ addressed: true, accepted: true, duplicate: false });
+    expect(latest).toMatchObject({ addressed: true, accepted: true, duplicate: true });
+    expect(latest.requestId).toBe(first.requestId);
+    expect(requests.get(first.requestId ?? "")).toMatchObject({
+      coalesceKey: "github-pr-head-move:101#1124",
+      nextAttemptAt: "2026-09-02T14:00:40.000Z",
+      event: { payload: { headSha: latestHead } },
+    });
+    expect(requests.listReady("2026-09-02T14:00:39.999Z")).toEqual([]);
+    expect(requests.listReady("2026-09-02T14:00:40.000Z")).toHaveLength(1);
+  });
+
   it("skips a synchronize already covered by Chip and resumes an uncovered requested head", async () => {
     const db = openDatabase(":memory:");
     const people = new PeopleStore(db);
@@ -803,7 +879,9 @@ describe("AgentCoordinator", () => {
     });
     const work = new WorkItemStore(db);
     const requests = new AgentRequestStore(db);
+    let now = new Date("2026-09-02T14:00:00.000Z");
     const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      now: () => now,
       sinkAdapterName: "hermes",
     });
     const item = work.getOrCreate({
@@ -866,12 +944,14 @@ describe("AgentCoordinator", () => {
       hermes,
       pino({ level: "silent" }),
       {
+        now: () => now,
         reviewCommitLookup,
         hermesSessionLookup: () => ({ hits: [], runningIds: new Set(), cmdlineBusy: false }),
       },
     );
 
     const covered = coordinator.accept(synchronize("sync-covered", false));
+    now = new Date(now.getTime() + 31_000);
     await worker.tick();
     expect(reviewCommitLookup).toHaveBeenCalledTimes(1);
     expect(hermes.calls).toHaveLength(0);
@@ -884,6 +964,7 @@ describe("AgentCoordinator", () => {
         "Exact-head local verification did not produce a retrievable aggregate result.",
     };
     const processMiss = coordinator.accept(synchronize("sync-process-miss", true));
+    now = new Date(now.getTime() + 31_000);
     await worker.tick();
     expect(hermes.calls).toEqual([
       expect.objectContaining({ kind: "resume", threadId: "wakewire-pr-1124" }),
@@ -891,6 +972,7 @@ describe("AgentCoordinator", () => {
 
     reviewEvidence = null;
     const unrequested = coordinator.accept(synchronize("sync-no-review", false));
+    now = new Date(now.getTime() + 31_000);
     await worker.tick();
     expect(hermes.calls).toHaveLength(1);
     expect(requests.get(unrequested.requestId ?? "")?.status).toBe("completed");
@@ -3678,7 +3760,9 @@ describe("AgentCoordinator", () => {
     });
     const work = new WorkItemStore(db);
     const requests = new AgentRequestStore(db);
+    let now = new Date("2026-09-02T14:00:00.000Z");
     const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      now: () => now,
       sinkAdapterName: "hermes",
     });
     const oldHead = "a".repeat(40);
@@ -3701,6 +3785,7 @@ describe("AgentCoordinator", () => {
       hermes,
       pino({ level: "silent" }),
       {
+        now: () => now,
         reviewStatusEnsure: async () => ({ summary: "pickup" }),
         reviewCommitLookup: async () => ({
           lastChipReviewSha: oldHead,
@@ -3746,6 +3831,7 @@ describe("AgentCoordinator", () => {
       targetMentions: undefined,
     };
     const restarted = coordinator.accept(synchronize);
+    now = new Date(now.getTime() + 31_000);
     const restartPass = worker.tick();
 
     try {
@@ -3780,7 +3866,9 @@ describe("AgentCoordinator", () => {
     });
     const work = new WorkItemStore(db);
     const requests = new AgentRequestStore(db);
+    let now = new Date("2026-09-02T14:00:00.000Z");
     const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      now: () => now,
       sinkAdapterName: "hermes",
     });
     const headSha = "a".repeat(40);
@@ -3799,7 +3887,7 @@ describe("AgentCoordinator", () => {
       { resolveIdentifier: async () => null, issuesForUrl: async () => [] },
       hermes,
       pino({ level: "silent" }),
-      { reviewStatusEnsure: async () => ({ summary: "pickup" }) },
+      { now: () => now, reviewStatusEnsure: async () => ({ summary: "pickup" }) },
     );
 
     const initialPass = worker.tick();
@@ -3817,6 +3905,7 @@ describe("AgentCoordinator", () => {
       targetMentions: undefined,
     };
     const duplicate = coordinator.accept(synchronize);
+    now = new Date(now.getTime() + 31_000);
     await worker.tick();
 
     expect(hermes.calls).toHaveLength(1);

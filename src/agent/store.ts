@@ -538,6 +538,9 @@ export class AgentRequestStore {
         const ack = this.ackForRequest(existing.id);
         return { request: existing, ack, duplicate: true };
       }
+      const executionProfile = ExecutionProfileSchema.parse(
+        args.executionProfile ?? DEFAULT_EXECUTION_PROFILE,
+      );
       const pending = coalesceKey ? this.findPendingByCoalesceKey(coalesceKey) : null;
       if (pending) {
         const now = nowIso();
@@ -550,19 +553,30 @@ export class AgentRequestStore {
           .run(dedup.scope, dedup.deliveryId, pending.id, now);
         this.db
           .prepare(
-            `UPDATE agent_requests SET next_attempt_at = ?, updated_at = ?
+            `UPDATE agent_requests
+             SET source_id = ?, source_delivery_id = ?, person_id = ?, work_item_id = ?,
+                 request_text = ?, execution_profile_json = ?, event_json = ?,
+                 next_attempt_at = ?, updated_at = ?
              WHERE id = ? AND status = 'acknowledged'`,
           )
-          .run(requestNotBefore, now, pending.id);
+          .run(
+            args.sourceId,
+            args.event.deliveryId,
+            args.personId,
+            args.workItemId,
+            args.requestText,
+            JSON.stringify(executionProfile),
+            JSON.stringify(args.event),
+            requestNotBefore,
+            now,
+            pending.id,
+          );
         const refreshed = this.get(pending.id);
         if (!refreshed) throw new Error(`coalesced request ${pending.id} disappeared`);
         return { request: refreshed, ack: this.ackForRequest(refreshed.id), duplicate: true };
       }
       const id = crypto.randomUUID();
       const now = nowIso();
-      const executionProfile = ExecutionProfileSchema.parse(
-        args.executionProfile ?? DEFAULT_EXECUTION_PROFILE,
-      );
       this.db
         .prepare(
           `INSERT INTO agent_requests
