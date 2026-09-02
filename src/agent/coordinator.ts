@@ -24,13 +24,17 @@ import {
   parseExecutionProfile,
 } from "./execution-profile.js";
 import {
-  githubReviewHeadMovePickupUpdate,
+  type ChipReviewCommit,
+  chipReviewCoversHead,
+  isProcessMissReviewAtHead,
+} from "./github-review-head.js";
+import {
   type GithubReviewArtifactExpectation,
   type GithubReviewBodyUpdate,
   type GithubReviewStatusPhase,
   type GithubReviewTestState,
+  githubReviewHeadMovePickupUpdate,
 } from "./github-review-status.js";
-import { chipReviewCoversHead, type ChipReviewCommit } from "./github-review-head.js";
 import { buildHermesSessionOptions, hermesTargetFromEvent } from "./hermes-identity.js";
 import {
   decideHermesSessionReuse,
@@ -1123,6 +1127,16 @@ export class AgentDispatchWorker {
         correlationMarker: result.correlationMarker,
       });
     } else if (result.finalResponse !== undefined) {
+      if (systemPrReview) {
+        const headSha = githubEventHeadSha(request.event);
+        if (headSha) {
+          const review = await this.reviewCommitLookup(request.event, signal);
+          signal.throwIfAborted();
+          if (review && isProcessMissReviewAtHead({ ...review, headSha })) {
+            throw new Error("system PR review produced only a process-miss GitHub review");
+          }
+        }
+      }
       let specialistStatus: "PASS" | "REPAIR" | "ESCALATE" | undefined;
       if (systemPrReview && systemPreflight?.mode === "full-review") {
         const expectation = {

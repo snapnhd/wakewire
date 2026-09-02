@@ -365,6 +365,8 @@ function inSessionExactHeadReviewRules(): string[] {
     "- Restore with git checkout -- <path> in the SHA-named clone only, then recheck that porcelain is empty and HEAD is unchanged.",
     "- Fail closed for every other dirty path or a lockfile changed by the PR. Never use git reset --hard or git clean.",
     "- Clone-root make test may DROP/CREATE those harness-gated local *_test databases. Do not refuse make test as a database reset.",
+    "- Do not submit a GitHub review whose only content is an exact-head or harness miss. Recover the clone or aggregate in this same session, then review the code.",
+    "- If the four-suite aggregate is missing or make test died, launch clone-root make test once with completion notification from this durable session. Record all four suite results when notified, then continue the review.",
   ];
 }
 

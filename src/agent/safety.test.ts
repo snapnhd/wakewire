@@ -353,6 +353,9 @@ describe("buildSafetyWrappedPrompt", () => {
     expect(prompt).toContain(
       "Never use git reset --hard or git clean",
     );
+    expect(prompt).toContain(
+      "Do not submit a GitHub review whose only content is an exact-head or harness miss",
+    );
   });
 
   it("reserves Gmail response delivery for WakeWire's final-reply outbox", () => {

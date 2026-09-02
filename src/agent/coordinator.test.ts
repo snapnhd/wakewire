@@ -972,6 +972,18 @@ describe("AgentCoordinator", () => {
       expect.objectContaining({ kind: "resume", threadId: "wakewire-pr-1124" }),
     ]);
     expect(reviewStatusUpdate).toHaveBeenCalledTimes(1);
+    expect(requests.get(processMiss.requestId ?? "")).toMatchObject({
+      status: "held",
+      error: "system PR review produced only a process-miss GitHub review",
+    });
+
+    reviewEvidence = {
+      lastChipReviewSha: headSha,
+      lastChipReviewState: "CHANGES_REQUESTED",
+      lastChipReviewBody: "blocking: the changed retry path can duplicate a review",
+    };
+    now = new Date(now.getTime() + 2_000);
+    await worker.tick();
     expect(requests.get(processMiss.requestId ?? "")?.status).toBe("completed");
 
     reviewEvidence = null;
@@ -980,6 +992,75 @@ describe("AgentCoordinator", () => {
     await worker.tick();
     expect(hermes.calls).toHaveLength(1);
     expect(requests.get(unrequested.requestId ?? "")?.status).toBe("completed");
+  });
+
+  it("holds a process-miss review and resumes its canonical session", async () => {
+    const db = openDatabase(":memory:");
+    const people = new PeopleStore(db);
+    people.setRole("pr", PR_ROLE_POLICY);
+    const reviewer = people.add({ nickname: "Chris", roleName: "pr" });
+    people.attachIdentity({
+      personId: reviewer.id,
+      provider: "github",
+      tenantId: "github.com",
+      externalId: "42786886",
+      handle: "cswoods6",
+    });
+    const work = new WorkItemStore(db);
+    const requests = new AgentRequestStore(db);
+    const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      sinkAdapterName: "hermes",
+    });
+    const headSha = "a9635bdfff3c48d4954d7d8962bac0c1f2b811cb";
+    const event = githubReviewRequestedEvent("gh-review-process-miss");
+    event.payload.headSha = headSha;
+    let now = new Date("2026-09-02T15:00:00.000Z");
+    let reviewEvidence = {
+      lastChipReviewSha: headSha,
+      lastChipReviewState: "COMMENTED",
+      lastChipReviewBody:
+        "The required exact-head local verification did not produce a retrievable aggregate result.",
+    };
+    const reviewCommitLookup = vi.fn(async () => reviewEvidence);
+    const hermes = new FinalResponseHermes("review turn finished");
+    const worker = new AgentDispatchWorker(
+      people,
+      work,
+      requests,
+      { resolveIdentifier: async () => null, issuesForUrl: async () => [] },
+      hermes,
+      pino({ level: "silent" }),
+      {
+        now: () => now,
+        reviewStatusEnsure: async () => ({ summary: "pickup" }),
+        reviewCommitLookup,
+        hermesSessionLookup: () => ({ hits: [], runningIds: new Set(), cmdlineBusy: false }),
+      },
+    );
+
+    const accepted = coordinator.accept(event);
+    await worker.tick();
+
+    expect(requests.get(accepted.requestId ?? "")).toMatchObject({
+      status: "held",
+      error: "system PR review produced only a process-miss GitHub review",
+    });
+    expect(hermes.calls).toEqual([expect.objectContaining({ kind: "start" })]);
+
+    reviewEvidence = {
+      lastChipReviewSha: headSha,
+      lastChipReviewState: "CHANGES_REQUESTED",
+      lastChipReviewBody: "blocking: the changed retry path can duplicate a review",
+    };
+    now = new Date("2026-09-02T15:00:02.000Z");
+    await worker.tick();
+
+    expect(hermes.calls).toEqual([
+      expect.objectContaining({ kind: "start" }),
+      expect.objectContaining({ kind: "resume", threadId: "hermes-thread-1" }),
+    ]);
+    expect(requests.get(accepted.requestId ?? "")?.status).toBe("completed");
+    expect(reviewCommitLookup).toHaveBeenCalledTimes(2);
   });
 
   it("debounces unmentioned enrolled feedback on a Chip-authored pull request", () => {

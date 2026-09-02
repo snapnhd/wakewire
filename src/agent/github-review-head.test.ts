@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import type { WakeEvent } from "../core/event.js";
 import type { SecretStore } from "../secrets/store.js";
-import { chipReviewCoversHead, createGithubReviewCommitLookup } from "./github-review-head.js";
+import {
+  chipReviewCoversHead,
+  createGithubReviewCommitLookup,
+  isProcessMissReviewAtHead,
+} from "./github-review-head.js";
 
 const HEAD = "1234567890abcdef1234567890abcdef12345678";
 const OTHER_HEAD = "abcdef1234567890abcdef1234567890abcdef12";
@@ -67,6 +71,48 @@ describe("chipReviewCoversHead", () => {
         lastChipReviewSha: null,
         lastChipReviewState: null,
         lastChipReviewBody: null,
+        headSha: HEAD,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("isProcessMissReviewAtHead", () => {
+  it.each([
+    "FRA-2950 at `a9635bdff`.\n\nThe required exact-head local verification did not produce a retrievable aggregate result, so I stopped before the Round 8 diff review and cannot approve this head.\n\nThis is a reviewer-side verification blocker, not a product-code finding; no author code change is requested.",
+    "Exact head validation could not retrieve the aggregate test result.",
+    "The review host-gate failed, so this role cannot prepare the clone.",
+    "The review workspace was unavailable and no task was launched.",
+    "The review clone is dirty with tracked changes in app/yarn.lock.",
+    "Local tests are stale: there is no live `make test` process.",
+  ])("classifies an exact-head process miss on the live head: %s", (body) => {
+    expect(
+      isProcessMissReviewAtHead({
+        lastChipReviewSha: HEAD,
+        lastChipReviewState: "COMMENTED",
+        lastChipReviewBody: body,
+        headSha: HEAD,
+      }),
+    ).toBe(true);
+  });
+
+  it("does not classify a code-blocking review as a process miss", () => {
+    expect(
+      isProcessMissReviewAtHead({
+        lastChipReviewSha: HEAD,
+        lastChipReviewState: "CHANGES_REQUESTED",
+        lastChipReviewBody: "blocking: the changed retry path can duplicate a review",
+        headSha: HEAD,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not classify process evidence from a different head", () => {
+    expect(
+      isProcessMissReviewAtHead({
+        lastChipReviewSha: OTHER_HEAD,
+        lastChipReviewState: "COMMENTED",
+        lastChipReviewBody: "Exact-head local verification did not produce an aggregate.",
         headSha: HEAD,
       }),
     ).toBe(false);

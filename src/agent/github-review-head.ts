@@ -14,19 +14,27 @@ export interface ChipReviewHeadEvidence extends ChipReviewCommit {
 }
 
 const PROCESS_MISS_PATTERNS = [
-  /exact[- ]head local verification/iu,
-  /retrievable aggregate/iu,
-  /host gate (?:is )?unavailable/iu,
+  /exact[- ]head[\s\S]{0,80}(?:verification|validation|check)[\s\S]{0,120}(?:aggregate|unavailable|missing|could not|did not|failed|retriev)/iu,
+  /(?:retriev\w*\s+)?aggregate(?:\s+(?:result|output|summary))?[\s\S]{0,80}(?:unavailable|missing|not found|could not|did not|failed)/iu,
+  /host[- ]gate[\s\S]{0,80}(?:unavailable|missing|cannot|could not|failed)/iu,
   /cannot be prepared under this review role/iu,
-  /workspace could not be prepared/iu,
-  /no agent task was started/iu,
-  /review clone has tracked changes/iu,
-  /local tests (?:are )?running[\s\S]*no live [`']?make test/iu,
+  /(?:review )?workspace[\s\S]{0,80}(?:unavailable|could not|cannot|failed to)[\s\S]{0,40}prepar/iu,
+  /no (?:agent )?task was (?:started|launched)/iu,
+  /review clone[\s\S]{0,80}(?:has tracked changes|tracked changes|dirty)/iu,
+  /local tests[\s\S]{0,80}(?:running|stale)[\s\S]{0,120}no live[\s\S]{0,20}[`']?make test/iu,
 ] as const;
 
 export function isProcessMissReviewBody(body: string | null | undefined): boolean {
   const text = body?.trim() ?? "";
   return text.length > 0 && PROCESS_MISS_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+export function isProcessMissReviewAtHead(evidence: ChipReviewHeadEvidence): boolean {
+  return (
+    evidence.lastChipReviewSha === evidence.headSha &&
+    evidence.lastChipReviewState?.trim().toUpperCase() === "COMMENTED" &&
+    isProcessMissReviewBody(evidence.lastChipReviewBody)
+  );
 }
 
 export function chipReviewCoversHead(evidence: ChipReviewHeadEvidence): boolean {
@@ -36,7 +44,7 @@ export function chipReviewCoversHead(evidence: ChipReviewHeadEvidence): boolean 
   if (state !== "COMMENTED") return false;
 
   const body = evidence.lastChipReviewBody?.trim() ?? "";
-  if (!body || isProcessMissReviewBody(body)) return false;
+  if (!body || isProcessMissReviewAtHead(evidence)) return false;
   return (
     /\bblocking\s*:/iu.test(body) ||
     /\bproduct findings?\s*:/iu.test(body) ||
