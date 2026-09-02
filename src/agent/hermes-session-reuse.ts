@@ -29,6 +29,7 @@ export interface HermesSessionHit {
 export type HermesReuseDecision =
   | { action: "create" }
   | { action: "resume"; sessionId: string }
+  | { action: "supersede"; sessionId: string }
   | { action: "ignore"; sessionId: string; reason: "running" }
   | { action: "hold"; sessionId: string; reason: "running" };
 
@@ -79,6 +80,25 @@ export function workRefNeedles(ref: HermesWorkRef): string[] {
   return needles;
 }
 
+/** True when session_key/chatId already names a different GitHub PR or Linear ticket. */
+export function sessionIdentityConflictsWithRef(
+  identity: { sessionKey?: string | null | undefined; chatId?: string | null | undefined },
+  ref: HermesWorkRef,
+): boolean {
+  const keys = new Set(sessionKeysForRef(ref));
+  for (const value of [identity.sessionKey, identity.chatId]) {
+    const token = value?.trim();
+    if (!token) continue;
+    if (
+      (token.startsWith("wakewire:github:") || token.startsWith("wakewire:linear:")) &&
+      !keys.has(token)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function sessionTextMatchesRef(text: string, ref: HermesWorkRef): boolean {
   const t = text.normalize("NFKC");
   if (ref.githubRepo && ref.githubNumber) {
@@ -104,19 +124,32 @@ export function sessionTextMatchesRef(text: string, ref: HermesWorkRef): boolean
 export function decideHermesSessionReuse(input: {
   ref: HermesWorkRef;
   boundSessionId?: string | null;
+  /** session_key of the bound Hermes row, when known. */
+  boundSessionKey?: string | null;
+  /** chat_id of the bound Hermes row, when known. */
+  boundChatId?: string | null;
   hits: readonly HermesSessionHit[];
   runningIds: ReadonlySet<string>;
   cmdlineBusy: boolean;
   /** GitHub review_requested (and re-request). Other events hold instead of ignore. */
   reviewRequest?: boolean | undefined;
+  /** The incoming review targets a different HEAD than the running frozen request. */
+  headMoved?: boolean | undefined;
 }): HermesReuseDecision {
-  const bound = input.boundSessionId?.trim() || "";
+  const boundConflicts = sessionIdentityConflictsWithRef(
+    { sessionKey: input.boundSessionKey, chatId: input.boundChatId },
+    input.ref,
+  );
+  const bound = boundConflicts ? "" : input.boundSessionId?.trim() || "";
   const runningBound = bound && input.runningIds.has(bound);
   const runningHit = input.hits.find((h) => input.runningIds.has(h.id));
   const busy = Boolean(runningBound || runningHit || input.cmdlineBusy);
   const busyId = runningBound ? bound : runningHit?.id || "unbound-running";
 
   if (busy) {
+    if (input.reviewRequest && input.headMoved) {
+      return { action: "supersede", sessionId: busyId };
+    }
     if (input.reviewRequest) {
       return { action: "ignore", sessionId: busyId, reason: "running" };
     }
@@ -230,6 +263,30 @@ export function defaultHermesSessionLookup(
 export function hermesStateDbPath(): string {
   const home = process.env.HERMES_HOME?.trim() || path.join(os.homedir(), ".hermes");
   return path.join(home, "state.db");
+}
+
+/** Read session_key/chat_id for a bound Hermes session. Missing DB/row is null. */
+export function loadHermesSessionIdentity(
+  sessionId: string,
+  options: { dbPath?: string } = {},
+): { sessionKey: string | null; chatId: string | null } | null {
+  const id = sessionId.trim();
+  if (!id) return null;
+  const dbPath = options.dbPath ?? hermesStateDbPath();
+  if (!fs.existsSync(dbPath)) return null;
+  try {
+    const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+    try {
+      const row = db
+        .prepare(`SELECT session_key AS sessionKey, chat_id AS chatId FROM sessions WHERE id = ?`)
+        .get(id) as { sessionKey: string | null; chatId: string | null } | undefined;
+      return row ?? null;
+    } finally {
+      db.close();
+    }
+  } catch {
+    return null;
+  }
 }
 
 function sessionIdsWithMatchingUserMessages(
@@ -356,6 +413,7 @@ function queryHermesWorkSessions(
       firstUserRequestsReview: firstUser.requestsReview.has(row.id),
     }));
     const matched = new Map<string, HermesSessionHit>();
+    const conflicted = new Set<string>();
     for (const row of candidates) {
       if (row.sessionKey && keys.has(row.sessionKey)) {
         matched.set(row.id, row);
@@ -365,13 +423,18 @@ function queryHermesWorkSessions(
         matched.set(row.id, row);
         continue;
       }
+      if (sessionIdentityConflictsWithRef(row, ref)) {
+        conflicted.add(row.id);
+        continue;
+      }
       if (row.title && sessionTextMatchesRef(row.title, ref)) {
         matched.set(row.id, row);
       }
     }
     // Mid-turn crash can leave session_key/title unset (wrapper title). Scan
     // user messages for repo#N / FRA-id so reboot resume still finds the PR.
-    const unmatched = candidates.filter((row) => !matched.has(row.id));
+    // Do not steal a session already keyed to a different PR/ticket.
+    const unmatched = candidates.filter((row) => !matched.has(row.id) && !conflicted.has(row.id));
     if (unmatched.length > 0) {
       for (const id of sessionIdsWithMatchingUserMessages(db, unmatched, ref)) {
         const row = unmatched.find((candidate) => candidate.id === id);

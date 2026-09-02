@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { Logger } from "../logging.js";
 import { HermesAgentAdapter } from "./hermes.js";
 import { PermanentError } from "./types.js";
@@ -89,6 +89,64 @@ sys.exit(0)
         },
       }),
     ).resolves.toEqual({ threadId: "sess-1", finalResponse: "hello from hermes" });
+  });
+
+  it("cancels only its session-keyed runner when the delivery signal aborts", async () => {
+    const { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } =
+      await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "hermes-adapter-abort-"));
+    const runner = join(dir, "runner.py");
+    const marker = join(dir, "runner.pid");
+    writeFileSync(
+      runner,
+      `#!/usr/bin/env python3
+import json, os, sys, time
+json.load(sys.stdin)
+with open(${JSON.stringify(marker)}, "w", encoding="utf-8") as marker_file:
+    marker_file.write(str(os.getpid()))
+time.sleep(30)
+`,
+    );
+    chmodSync(runner, 0o755);
+    const adapter = new HermesAgentAdapter(logger, {
+      runnerPath: runner,
+      hermesPython: "python3",
+    });
+    const controller = new AbortController();
+    const delivery = adapter.deliverToThread("sess-abort", "review", {
+      sandbox: "workspace-write",
+      signal: controller.signal,
+      hermesSession: {
+        platform: "github",
+        userId: "reviewer",
+        sessionKey: "wakewire:github:snapnhd/system#1097",
+      },
+    });
+
+    try {
+      await vi.waitFor(() => expect(existsSync(marker)).toBe(true));
+      controller.abort(new Error("head moved"));
+      const outcome = await Promise.race([
+        delivery.then(
+          () => "resolved",
+          () => "rejected",
+        ),
+        new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 500)),
+      ]);
+      expect(outcome).toBe("rejected");
+    } finally {
+      if (existsSync(marker)) {
+        try {
+          process.kill(Number(readFileSync(marker, "utf8")), "SIGKILL");
+        } catch {
+          // The adapter already stopped the exact fixture process.
+        }
+      }
+      await Promise.allSettled([delivery]);
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("setThreadTitle and readThreadTitle round-trip via runner actions", async () => {

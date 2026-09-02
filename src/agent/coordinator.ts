@@ -23,6 +23,12 @@ import {
   type ExecutionReasoningEffort,
   parseExecutionProfile,
 } from "./execution-profile.js";
+import type {
+  GithubReviewArtifactExpectation,
+  GithubReviewBodyUpdate,
+  GithubReviewStatusPhase,
+  GithubReviewTestState,
+} from "./github-review-status.js";
 import { chipReviewCoversHead, type ChipReviewCommit } from "./github-review-head.js";
 import { buildHermesSessionOptions, hermesTargetFromEvent } from "./hermes-identity.js";
 import {
@@ -30,6 +36,7 @@ import {
   type HermesReuseDecision,
   type HermesSessionLookup,
   type HermesWorkRef,
+  loadHermesSessionIdentity,
   workRefFromTarget,
   workRefIsEmpty,
 } from "./hermes-session-reuse.js";
@@ -65,13 +72,27 @@ import {
   type SafetyWrappedPromptInput,
 } from "./safety.js";
 import {
-  InvalidSnapBranchError,
+  runSnapReviewPreflight,
+  SNAP_REVIEW_PROJECTS,
+  type SnapReviewProject,
+  type SnapReviewTestResult,
+} from "./snap-review-preflight.js";
+import {
+  InvalidSnapWorkspaceInputError,
+  type ResolvedSnapWorkspace,
   resolveSnapWorkspace,
   SNAP_ROOT,
+  SNAP_WORKSPACES_ROOT,
   SnapWorkspaceCommandError,
+  type SnapWorkspaceInput,
   type SnapWorkspaceResolverOptions,
   SnapWorkspaceValidationError,
 } from "./snap-workspace.js";
+import {
+  extractSystemPrSpecialistProof,
+  SYSTEM_PR_SPECIALIST_PROOF_MARKER,
+  type SystemPrSpecialistProofLookup,
+} from "./specialist-proof.js";
 import {
   type AgentRequest,
   type AgentRequestStore,
@@ -85,9 +106,11 @@ import {
   type ChipIdentityConfig,
   DEFAULT_CHIP_IDENTITIES,
   exactPingPongReply,
+  hasChipGithubMention,
   isChipAddressed,
   isChipMaintainedPrFeedback,
   isChipPrincipal,
+  isChipReviewThreadReply,
   requestText,
 } from "./targeting.js";
 import { buildWorkItemTitle } from "./thread-title.js";
@@ -137,21 +160,35 @@ export class AgentCoordinator {
   }
 
   accept(event: WakeEvent): AgentAcceptance {
-    let addressed = isChipAddressed(event, this.chip);
-    if (!addressed && event.source === "github" && event.kind === "pull_request.synchronize") {
+    return this.acceptAddressed(event, this.isAddressed(event));
+  }
+
+  /**
+   * Mentions, review requests, and Chip-authored PR feedback are sufficient.
+   * An unmentioned reply in a review thread only addresses Chip when Chip
+   * already has a GitHub work item for that PR.
+   */
+  private isAddressed(event: WakeEvent): boolean {
+    if (isChipAddressed(event, this.chip)) return true;
+    if (event.source === "github" && event.kind === "pull_request.synchronize") {
       const author = stringPayload(event, "author").trim().toLowerCase();
       const state = stringPayload(event, "state").trim().toLowerCase();
-      const eligibleJoinedPr =
-        author !== this.chip.githubHandle.trim().toLowerCase() &&
-        state !== "closed" &&
-        event.payload.merged !== true;
-      addressed =
-        eligibleJoinedPr &&
-        correlationAliases(event, "").some(
-          (alias) => this.workItems.findByAlias("correlation", alias.kind, alias.key) !== null,
-        );
+      if (
+        author === this.chip.githubHandle.trim().toLowerCase() ||
+        state === "closed" ||
+        event.payload.merged === true
+      ) {
+        return false;
+      }
+      return this.hasGithubPrWorkItem(event);
     }
-    return this.acceptAddressed(event, addressed);
+    return isChipReviewThreadReply(event) && this.hasGithubPrWorkItem(event);
+  }
+
+  private hasGithubPrWorkItem(event: WakeEvent): boolean {
+    return correlationAliases(event, "").some(
+      (alias) => this.workItems.findByAlias("correlation", alias.kind, alias.key) !== null,
+    );
   }
 
   /**
@@ -186,6 +223,11 @@ export class AgentCoordinator {
     const text = requestText(event);
     const executionProfile = enforceGithubPrReviewEffort(event, parseExecutionProfile(text));
     const maintainedPrFeedback = isChipMaintainedPrFeedback(event, this.chip);
+    const unmentionedThreadReply =
+      isChipReviewThreadReply(event) &&
+      !maintainedPrFeedback &&
+      !hasChipGithubMention(event, this.chip);
+    const debounceFeedback = maintainedPrFeedback || unmentionedThreadReply;
     const acceptedAt = this.now();
     let ackSpec: ReturnType<typeof buildAckSpec>;
     try {
@@ -213,7 +255,7 @@ export class AgentCoordinator {
     const progressAckNotBefore = delayedProgressAck
       ? new Date(acceptedAt.getTime() + this.progressAckDelayMs).toISOString()
       : undefined;
-    const requestNotBefore = maintainedPrFeedback
+    const requestNotBefore = debounceFeedback
       ? new Date(acceptedAt.getTime() + MAINTAINED_PR_FEEDBACK_DEBOUNCE_MS).toISOString()
       : undefined;
     const accepted = this.requests.accept({
@@ -224,9 +266,11 @@ export class AgentCoordinator {
       requestText: text,
       executionProfile,
       dedup: requestDedupKey(event),
-      ...(maintainedPrFeedback
+      ...(debounceFeedback
         ? {
-            coalesceKey: maintainedPrFeedbackKey(event),
+            coalesceKey: maintainedPrFeedback
+              ? maintainedPrFeedbackKey(event)
+              : reviewThreadReplyKey(event),
             requestNotBefore,
           }
         : {}),
@@ -296,6 +340,21 @@ export interface GithubReviewStatus {
   url?: string | undefined;
 }
 
+export type SystemPrPreflight =
+  | {
+      mode: "full-review";
+      workspace: ResolvedSnapWorkspace;
+      tests: SnapReviewTestResult;
+      priorReviewArtifact: boolean;
+    }
+  | {
+      mode: "test-failure-only";
+      workspace: ResolvedSnapWorkspace;
+      tests: SnapReviewTestResult;
+      priorReviewArtifact: boolean;
+    }
+  | { mode: "workspace-failure"; reason: string };
+
 export interface AgentDispatchWorkerOptions {
   tickMs?: number;
   /** Maximum number of unrelated work items submitted concurrently. */
@@ -304,29 +363,38 @@ export interface AgentDispatchWorkerOptions {
   safetyScreener?: SafetyScreener;
   parentReportFence?: ParentReportFence;
   resolveWorkspace?: (
-    branch: string,
-    options?: Pick<SnapWorkspaceResolverOptions, "signal" | "mode">,
+    input: SnapWorkspaceInput,
+    options?: Pick<SnapWorkspaceResolverOptions, "signal">,
   ) => ReturnType<typeof resolveSnapWorkspace>;
+  runReviewPreflight?: (
+    workspace: Pick<ResolvedSnapWorkspace, "ticket" | "cwd">,
+    options?: { signal?: AbortSignal | undefined },
+  ) => Promise<SnapReviewTestResult>;
   onReplyQueued?: (() => void) | undefined;
   /**
    * Path D: find an existing Hermes session for this GitHub PR / Linear ticket.
    * Tests inject a stub. Production reads ~/.hermes/state.db + process list.
    */
   hermesSessionLookup?: (ref: HermesWorkRef) => HermesSessionLookup;
-  /** Reads the existing Chip status comment for duplicate GitHub rereview requests. */
+  /** Reads the existing PR-body status for duplicate GitHub rereview requests. */
   reviewStatusLookup?: (
     event: WakeEvent,
     signal?: AbortSignal | undefined,
   ) => Promise<GithubReviewStatus | null>;
-  /** Creates the Chip pickup status comment if it is missing. */
+  /** Creates or refreshes the PR-body pickup status. */
   reviewStatusEnsure?: (
     event: WakeEvent,
+    signal?: AbortSignal | undefined,
+  ) => Promise<GithubReviewStatus | null>;
+  reviewStatusUpdate?: (
+    event: WakeEvent,
+    update: GithubReviewBodyUpdate,
     signal?: AbortSignal | undefined,
   ) => Promise<GithubReviewStatus | null>;
   /** Verifies that a formal review request produced a GitHub review or status artifact. */
   reviewArtifactLookup?: (
     event: WakeEvent,
-    since: string,
+    expectation: GithubReviewArtifactExpectation,
     signal?: AbortSignal | undefined,
   ) => Promise<boolean>;
   /** Returns Chip's latest submitted review for live-HEAD coverage decisions. */
@@ -334,6 +402,8 @@ export interface AgentDispatchWorkerOptions {
     event: WakeEvent,
     signal?: AbortSignal | undefined,
   ) => Promise<ChipReviewCommit | null>;
+  /** Verifies a full-review proof against the private specialist coordinator state. */
+  specialistProofLookup?: SystemPrSpecialistProofLookup;
 }
 
 /** Correlates, provisions, and submits accepted requests independently of acknowledgments. */
@@ -343,6 +413,9 @@ export class AgentDispatchWorker {
   private readonly now: () => Date;
   private readonly safetyScreener: SafetyScreener;
   private readonly workspaceResolver: NonNullable<AgentDispatchWorkerOptions["resolveWorkspace"]>;
+  private readonly reviewPreflightRunner: NonNullable<
+    AgentDispatchWorkerOptions["runReviewPreflight"]
+  >;
   private readonly parentReportFence: ParentReportFence;
   private readonly onReplyQueued: () => void;
   private readonly hermesSessionLookup: (ref: HermesWorkRef) => HermesSessionLookup;
@@ -352,15 +425,22 @@ export class AgentDispatchWorker {
   private readonly reviewStatusEnsure: NonNullable<
     AgentDispatchWorkerOptions["reviewStatusEnsure"]
   >;
+  private readonly reviewStatusUpdate: NonNullable<
+    AgentDispatchWorkerOptions["reviewStatusUpdate"]
+  >;
   private readonly reviewArtifactLookup: NonNullable<
     AgentDispatchWorkerOptions["reviewArtifactLookup"]
   >;
   private readonly reviewCommitLookup: NonNullable<
     AgentDispatchWorkerOptions["reviewCommitLookup"]
   >;
+  private readonly specialistProofLookup: NonNullable<
+    AgentDispatchWorkerOptions["specialistProofLookup"]
+  >;
   private readonly activeWorkItems = new Set<string>();
   private readonly activeRequests = new Map<string, Promise<void>>();
   private readonly activeAbortControllers = new Map<string, AbortController>();
+  private readonly supersedingWorkItems = new Set<string>();
   private readonly canonicalWorkItemLocks = new Map<string, Promise<void>>();
   private timer: NodeJS.Timeout | null = null;
   private ticking = false;
@@ -384,6 +464,10 @@ export class AgentDispatchWorker {
     this.now = options.now ?? (() => new Date());
     this.safetyScreener = options.safetyScreener ?? new PlaceholderLocalSafetyScreener();
     this.workspaceResolver = options.resolveWorkspace ?? resolveSnapWorkspace;
+    this.reviewPreflightRunner =
+      options.runReviewPreflight ??
+      ((workspace, preflightOptions) =>
+        runSnapReviewPreflight(workspace, { signal: preflightOptions?.signal }));
     this.parentReportFence = options.parentReportFence ?? new ParentReportFence();
     this.onReplyQueued = options.onReplyQueued ?? (() => {});
     this.hermesSessionLookup =
@@ -391,8 +475,10 @@ export class AgentDispatchWorker {
       (() => ({ hits: [], runningIds: new Set(), cmdlineBusy: false }));
     this.reviewStatusLookup = options.reviewStatusLookup ?? (async () => null);
     this.reviewStatusEnsure = options.reviewStatusEnsure ?? (async () => null);
+    this.reviewStatusUpdate = options.reviewStatusUpdate ?? (async () => null);
     this.reviewArtifactLookup = options.reviewArtifactLookup ?? (async () => false);
     this.reviewCommitLookup = options.reviewCommitLookup ?? (async () => null);
+    this.specialistProofLookup = options.specialistProofLookup ?? (async () => false);
   }
 
   start(): number {
@@ -441,7 +527,13 @@ export class AgentDispatchWorker {
           this.activeWorkItems.has(current.workItemId) &&
           isGithubReviewStartRequest(current.event)
         ) {
-          launched.push(this.launchReviewAlreadyRunning(current));
+          if (this.supersedingWorkItems.has(current.workItemId)) continue;
+          const active = this.activeRequestForWorkItem(current.workItemId, current.id);
+          if (active && githubReviewHeadMoved(active.event, current.event)) {
+            launched.push(this.launchHeadMoveSupersede(current, active));
+          } else {
+            launched.push(this.launchReviewAlreadyRunning(current));
+          }
         }
       }
 
@@ -524,14 +616,50 @@ export class AgentDispatchWorker {
     return operation;
   }
 
+  private activeRequestForWorkItem(workItemId: string, excludeRequestId: string): AgentRequest | null {
+    for (const requestId of this.activeRequests.keys()) {
+      if (requestId === excludeRequestId) continue;
+      const request = this.requests.get(requestId);
+      if (request?.workItemId === workItemId) return request;
+    }
+    return null;
+  }
+
+  private launchHeadMoveSupersede(request: AgentRequest, active: AgentRequest): Promise<void> {
+    this.supersedingWorkItems.add(request.workItemId);
+    return (async () => {
+      const newHead = stringPayload(request.event, "headSha").trim().toLowerCase();
+      const message = `superseded by PR HEAD ${newHead}`;
+      this.requests.supersedeRequest(active.id, message);
+      this.activeAbortControllers.get(active.id)?.abort(new Error(message));
+      const activeOperation = this.activeRequests.get(active.id);
+      if (activeOperation) await activeOperation;
+      const current = this.requests.get(request.id);
+      if (!current || (current.status !== "acknowledged" && current.status !== "held")) return;
+      await this.launch(current, true);
+    })().finally(() => this.supersedingWorkItems.delete(request.workItemId));
+  }
+
   private async stageReviewAlreadyRunning(
     request: AgentRequest,
     item: WorkItem,
     signal: AbortSignal,
   ): Promise<void> {
+    if (isSystemPrReviewEvent(request.event)) {
+      this.requests.finalizeImmediateCompletion({
+        requestId: request.id,
+        codexThreadId: item.codexThreadId || `review-in-progress-${request.id}`,
+        status: "completed",
+      });
+      this.logger.info(
+        { request: request.id, workItem: item.id, session: item.codexThreadId },
+        "ignored duplicate system PR review while the canonical parent is active",
+      );
+      return;
+    }
     const status =
-      (await this.reviewStatusEnsure(request.event, signal).catch(() => null)) ??
-      (await this.reviewStatusLookup(request.event, signal).catch(() => null));
+      (await this.reviewStatusLookup(request.event, signal).catch(() => null)) ??
+      (await this.reviewStatusEnsure(request.event, signal).catch(() => null));
     signal.throwIfAborted();
     const summary = status?.summary.trim() || "review in progress";
     const url = status?.url?.trim() || githubPullRequestUrl(request.event);
@@ -736,18 +864,7 @@ export class AgentDispatchWorker {
       );
       return;
     }
-    if (request.event.kind === "pull_request.review_requested") {
-      await this.reviewStatusEnsure(request.event, signal).catch((error) => {
-        this.logger.warn(
-          {
-            request: request.id,
-            err: error instanceof Error ? error.message : String(error),
-          },
-          "could not ensure Chip review status comment",
-        );
-        return null;
-      });
-    }
+    const systemPrReview = isSystemPrReviewEvent(request.event);
     const screenInput: SafetyScreenInput = {
       principal: {
         id: person.id,
@@ -839,15 +956,31 @@ export class AgentDispatchWorker {
     if (reuse?.action === "hold") {
       throw new BusyError(`hermes session ${reuse.sessionId} in flight`);
     }
+    if (request.event.kind === "pull_request.review_requested") {
+      const status = await this.reviewStatusEnsure(request.event, signal);
+      if (systemPrReview && !status) {
+        throw new Error("system PR pickup status could not be verified in the pull request body");
+      }
+    }
+    // Exact-head clone/tests belong to Hermes. Do not boot a managed workspace
+    // or stamp workspace-failed before the review session starts.
+    const systemPreflight = skippedSystemPrPreflight();
     const resumeId = reuse?.action === "resume" ? reuse.sessionId : item.codexThreadId;
     const existingOrchestration = this.requests.orchestrationForRequest(request.id);
-    const cwd = existingOrchestration
-      ? existingOrchestration.cwd
-      : resumeId
-        ? trustedResumeCwd(item.cwd)
-        : await this.resolveCwd(linearIssue, item, request.event, signal);
+    const resumeMaintainedPrSession =
+      Boolean(resumeId) && isChipMaintainedPrFeedback(request.event);
+    const cwd = systemPrReview
+      ? SNAP_ROOT
+      : existingOrchestration
+        ? existingOrchestration.cwd
+        : resumeMaintainedPrSession
+          ? (item.cwd ?? SNAP_ROOT)
+          : await this.resolveCwd(linearIssue, item, signal);
+    if (systemPreflight && existingOrchestration && existingOrchestration.cwd !== cwd) {
+      throw new WorkItemConflictError("persisted PR orchestration has a stale workspace identity");
+    }
     signal.throwIfAborted();
-    if (!existingOrchestration) this.workItems.setWorkspace(item.id, cwd);
+    if (!existingOrchestration || systemPreflight) this.workItems.setWorkspace(item.id, cwd);
     item = this.workItems.get(item.id) ?? item;
     if (this.requests.hasLaterStop(request.id, item.id)) {
       this.requests.supersedeRequest(
@@ -872,6 +1005,7 @@ export class AgentDispatchWorker {
       policy,
       assessment,
       execution,
+      systemPreflight && systemPreflight.mode !== "workspace-failure" ? systemPreflight : undefined,
     );
     if (execution.delegateToSeparateTask) {
       await this.dispatchSeparateRequest(dispatchRequest, item, promptInput, cwd, policy, signal);
@@ -957,6 +1091,11 @@ export class AgentDispatchWorker {
     }
     signal.throwIfAborted();
     if (result.correlationMarker) {
+      if (systemPrReview) {
+        throw new Error(
+          "system PR review completion requires an immediate host-verifiable final response",
+        );
+      }
       this.requests.bindSubmittedCompletion({
         requestId: request.id,
         codexThreadId: result.threadId,
@@ -964,23 +1103,88 @@ export class AgentDispatchWorker {
         correlationMarker: result.correlationMarker,
       });
     } else if (result.finalResponse !== undefined) {
-      const missingReviewArtifact =
-        request.event.kind === "pull_request.review_requested" &&
-        !(await this.reviewArtifactLookup(request.event, request.event.occurredAt, signal).catch(
-          () => false,
-        ));
-      if (missingReviewArtifact) {
-        this.requests.stageImmediateFinalReply({
+      let specialistStatus: "PASS" | "REPAIR" | "ESCALATE" | undefined;
+      if (systemPrReview && systemPreflight?.mode === "full-review") {
+        const expectation = {
+          reviewKey: systemPrReviewKey(request.event),
+          headSha: systemPreflight.tests.headSha,
+          invocationId: systemPrInvocationId(request),
+        };
+        const proof = extractSystemPrSpecialistProof(result.finalResponse, expectation);
+        const trusted = proof ? await this.specialistProofLookup(proof).catch(() => false) : false;
+        if (!trusted) {
+          await this.updateSystemPrCompletionStatus(
+            request.event,
+            systemPreflight,
+            "specialists-incomplete",
+            "specialist proof incomplete; retrying",
+            signal,
+            "system PR specialist hold status could not be verified",
+          );
+          throw new Error("system PR review did not produce a trusted exact-head specialist proof");
+        }
+        specialistStatus = proof?.status;
+      }
+      if (systemPrReview && systemPreflight && systemPreflight.mode !== "workspace-failure") {
+        if (
+          systemPreflight.mode === "test-failure-only" &&
+          result.finalResponse.includes(SYSTEM_PR_SPECIALIST_PROOF_MARKER)
+        ) {
+          await this.updateSystemPrCompletionStatus(
+            request.event,
+            systemPreflight,
+            "review-incomplete",
+            "unexpected specialist proof in test-failure-only mode; retrying",
+            signal,
+            "system PR test-failure proof rejection status could not be verified",
+          );
+          throw new Error("test-failure-only review returned prohibited specialist evidence");
+        }
+        const hasReviewArtifact = await this.reviewArtifactLookup(
+          request.event,
+          reviewArtifactExpectation(request, systemPreflight, specialistStatus),
+          signal,
+        );
+        if (!hasReviewArtifact) {
+          await this.updateSystemPrCompletionStatus(
+            request.event,
+            systemPreflight,
+            "review-incomplete",
+            "GitHub review artifact missing; retrying",
+            signal,
+            "system PR review hold status could not be verified",
+          );
+          throw new Error("system PR review completed without a verified GitHub review artifact");
+        }
+        if (specialistStatus === "REPAIR" || specialistStatus === "ESCALATE") {
+          await this.updateSystemPrCompletionStatus(
+            request.event,
+            systemPreflight,
+            "specialists-waiting",
+            specialistStatus === "REPAIR"
+              ? "specialist changes required"
+              : "specialist reconciliation required",
+            signal,
+            "system PR specialist verdict status could not be verified",
+          );
+        }
+        this.requests.finalizeImmediateCompletion({
           requestId: request.id,
           codexThreadId: result.threadId,
           ...(result.turnId ? { codexTurnId: result.turnId } : {}),
-          spec: buildGithubReviewProgressReplySpec(request.event, result.finalResponse),
+          status: "completed",
         });
-        this.onReplyQueued();
-        this.logger.warn(
-          { request: request.id, threadId: result.threadId },
-          "GitHub review request returned without a review artifact; surfaced final response",
+        this.logger.info(
+          { request: request.id, threadId: result.threadId, hasReviewArtifact },
+          "GitHub review request completed with a verified review artifact",
         );
+      } else if (systemPrReview) {
+        this.requests.finalizeImmediateCompletion({
+          requestId: request.id,
+          codexThreadId: result.threadId,
+          ...(result.turnId ? { codexTurnId: result.turnId } : {}),
+          status: "completed",
+        });
       } else {
         try {
           const spec = buildFinalReplySpec(request.event, result.finalResponse);
@@ -1068,6 +1272,16 @@ export class AgentDispatchWorker {
       reportPromptPrefix: prompts.reportPromptPrefix,
       reportPromptSuffix: prompts.reportPromptSuffix,
     });
+    if (
+      promptInput.githubReviewPreflight &&
+      (orchestration.childPrompt !== prompts.childPrompt ||
+        orchestration.reportPromptPrefix !== prompts.reportPromptPrefix ||
+        orchestration.reportPromptSuffix !== prompts.reportPromptSuffix)
+    ) {
+      throw new PermanentError(
+        "stale system PR orchestration does not match fresh preflight proof",
+      );
+    }
 
     let parentThreadId = orchestration.parentThreadId ?? item.codexThreadId;
     if (!parentThreadId) {
@@ -1354,15 +1568,18 @@ export class AgentDispatchWorker {
 
     const nativeLinear = linearIssueFromEvent(event);
     if (nativeLinear) addLinearMatch(nativeLinear, "native Linear event");
-    for (const identifier of uniqueLinearIdentifiers(references)) {
-      if (nativeLinear?.identifier === identifier) continue;
-      if (event.source === "github" && githubPrimary && identifier !== githubPrimary) continue;
-      const resolved = await this.lookupLinearIssue(identifier, event);
-      if (!resolved) {
-        if (event.source === "github") continue;
-        throw new UnresolvedLinearReferenceError(identifier);
+    // Linear-origin comments stay on the issue they were posted on. Extra
+    // FRA/ENG ids in the title or body are references, not more work items.
+    if (!nativeLinear) {
+      for (const identifier of uniqueLinearIdentifiers(references)) {
+        if (event.source === "github" && githubPrimary && identifier !== githubPrimary) continue;
+        const resolved = await this.lookupLinearIssue(identifier, event);
+        if (!resolved) {
+          if (event.source === "github") continue;
+          throw new UnresolvedLinearReferenceError(identifier);
+        }
+        addLinearMatch(resolved, identifier);
       }
-      addLinearMatch(resolved, identifier);
     }
     if (nativeLinear && !nativeLinear.branchName) {
       const resolved = await this.lookupLinearIssue(nativeLinear.identifier, event);
@@ -1389,6 +1606,7 @@ export class AgentDispatchWorker {
         if (event.source === "github" && githubPrimary && issue.identifier !== githubPrimary) {
           continue;
         }
+        if (nativeLinear && issue.identifier !== nativeLinear.identifier) continue;
         addLinearMatch(issue, url);
       }
     }
@@ -1399,6 +1617,11 @@ export class AgentDispatchWorker {
         }
       } else {
         linearMatches.clear();
+      }
+    }
+    if (nativeLinear && linearMatches.size > 1) {
+      for (const [key, issue] of [...linearMatches.entries()]) {
+        if (issue.identifier !== nativeLinear.identifier) linearMatches.delete(key);
       }
     }
     if (linearMatches.size > 1) {
@@ -1481,9 +1704,11 @@ export class AgentDispatchWorker {
     } catch {
       lookup = { hits: [], runningIds: new Set(), cmdlineBusy: false };
     }
+    const identity = item.codexThreadId ? loadHermesSessionIdentity(item.codexThreadId) : null;
     return decideHermesSessionReuse({
       ref,
       boundSessionId: item.codexThreadId,
+      ...(identity ? { boundSessionKey: identity.sessionKey, boundChatId: identity.chatId } : {}),
       hits: lookup.hits,
       runningIds: lookup.runningIds,
       cmdlineBusy: lookup.cmdlineBusy,
@@ -1491,39 +1716,153 @@ export class AgentDispatchWorker {
       // running. A crash/timeout retry must hold instead, then resume when the
       // old process exits; marking that retry complete would lose the review.
       reviewRequest: isGithubReviewStartRequest(request.event) && request.attemptCount === 0,
+      headMoved: githubSynchronizeHeadMoved(request.event),
     });
+  }
+
+  // Host-managed workspace preflight is retired. Left uncalled so Path D cannot
+  // stamp workspace-failed over a live review.
+  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: retired stamp path
+  private async prepareSystemPrReview(
+    event: WakeEvent,
+    linear: ResolvedLinearIssue | undefined,
+    priorReviewArtifact: boolean,
+    signal: AbortSignal,
+  ): Promise<SystemPrPreflight> {
+    const updatedAt = (): string => this.now().toISOString();
+    const updateStatus = async (update: GithubReviewBodyUpdate): Promise<void> => {
+      const result = await this.reviewStatusUpdate(event, update, signal);
+      if (!result) throw new Error("system PR status update could not be verified");
+    };
+    await updateStatus({
+      links: null,
+      status: { phase: "workspace-starting", updatedAt: updatedAt() },
+    });
+
+    let workspace: ResolvedSnapWorkspace;
+    try {
+      const pullRequestUrl = systemPullRequestUrl(event);
+      if (!pullRequestUrl) throw new SnapWorkspaceValidationError("system PR URL is missing");
+      workspace = await this.workspaceResolver(
+        {
+          ...(linear ? { authoritativeLinearInput: linear.identifier } : {}),
+          pullRequestUrl,
+        },
+        { signal },
+      );
+    } catch (error) {
+      if (signal.aborted) throw error;
+      await updateStatus({
+        links: null,
+        status: { phase: "workspace-failed", updatedAt: updatedAt() },
+      });
+      return { mode: "workspace-failure", reason: "system PR workspace preflight failed" };
+    }
+
+    await updateStatus({
+      links: workspace.urls,
+      expectedHeadSha: workspace.headSha,
+      status: { phase: "workspace-ready", updatedAt: updatedAt(), headSha: workspace.headSha },
+    });
+    const pendingTests: Record<SnapReviewProject, GithubReviewTestState> = {
+      app: "running",
+      data: "pending",
+      snapcorp: "pending",
+      windmill: "pending",
+    };
+    await updateStatus({
+      expectedHeadSha: workspace.headSha,
+      status: {
+        phase: "tests-running",
+        updatedAt: updatedAt(),
+        headSha: workspace.headSha,
+        tests: pendingTests,
+      },
+    });
+
+    let tests: SnapReviewTestResult;
+    try {
+      tests = await this.reviewPreflightRunner(workspace, { signal });
+    } catch (error) {
+      if (signal.aborted) throw error;
+      tests = {
+        headSha: workspace.headSha,
+        passed: false,
+        suites: { app: "missing", data: "missing", snapcorp: "missing", windmill: "missing" },
+        diagnosticTail: "aggregate test runner failed before a complete summary",
+      };
+    }
+    const exactPass =
+      tests.passed === true &&
+      tests.headSha === workspace.headSha &&
+      /^[0-9a-f]{40}$/u.test(tests.headSha) &&
+      SNAP_REVIEW_PROJECTS.every((project) => tests.suites[project] === "passed");
+    await updateStatus({
+      expectedHeadSha: workspace.headSha,
+      status: {
+        phase: exactPass ? "tests-passed" : "tests-failed",
+        updatedAt: updatedAt(),
+        headSha: tests.headSha,
+        tests: tests.suites,
+      },
+    });
+    return {
+      mode: exactPass ? "full-review" : "test-failure-only",
+      workspace,
+      tests,
+      priorReviewArtifact,
+    };
+  }
+
+  private async updateSystemPrCompletionStatus(
+    event: WakeEvent,
+    preflight: Exclude<SystemPrPreflight, { mode: "workspace-failure" }> | undefined,
+    phase: Extract<
+      GithubReviewStatusPhase,
+      "specialists-incomplete" | "review-incomplete" | "specialists-waiting"
+    >,
+    detail: string,
+    signal: AbortSignal,
+    verificationFailure: string,
+  ): Promise<void> {
+    const headSha = preflight?.tests.headSha;
+    const status = await this.reviewStatusUpdate(
+      event,
+      {
+        ...(headSha ? { expectedHeadSha: headSha } : {}),
+        status: {
+          phase,
+          updatedAt: this.now().toISOString(),
+          detail,
+          ...(headSha ? { headSha } : {}),
+          ...(preflight ? { tests: preflight.tests.suites } : {}),
+        },
+      },
+      signal,
+    );
+    if (!status) throw new Error(verificationFailure);
   }
 
   private async resolveCwd(
     linear: ResolvedLinearIssue | undefined,
     item: WorkItem,
-    event: WakeEvent,
     signal: AbortSignal,
   ): Promise<string> {
-    const mode = isGithubPullRequestEvent(event) ? "pull-request" : "issue";
     if (linear) {
-      if (!linear.branchName) {
-        // Linear issue known but no Snap-valid branch (long GitHub names,
-        // underscores, missing gitBranchName). Chat/Hermes can still run at
-        // the Snap monorepo root; coding tasks that need prepare should cite
-        // an exact controller branch.
-        return SNAP_ROOT;
-      }
-      return (await this.workspaceResolver(linear.branchName, { signal, mode })).cwd;
+      return (
+        await this.workspaceResolver({ authoritativeLinearInput: linear.identifier }, { signal })
+      ).cwd;
     }
     if (item.canonicalKind !== "linear") return SNAP_ROOT;
 
-    // Alias reuse can select an already-promoted Linear work item without a
-    // fresh issue lookup. If the previous turn already fell back to SNAP_ROOT
-    // (no valid controller branch), keep chatting there — do not fail closed.
     if (!item.cwd || item.cwd === SNAP_ROOT) return SNAP_ROOT;
-    if (path.dirname(item.cwd) !== SNAP_ROOT) {
+    if (path.dirname(item.cwd) !== SNAP_WORKSPACES_ROOT) {
       throw new WorkItemConflictError(
         `Linear work item ${item.canonicalKey} has no trusted Snap workspace`,
       );
     }
-    const branch = path.basename(item.cwd);
-    const resolved = await this.workspaceResolver(branch, { signal, mode });
+    const ticket = path.basename(item.cwd);
+    const resolved = await this.workspaceResolver({ authoritativeLinearInput: ticket }, { signal });
     if (resolved.cwd !== item.cwd) {
       throw new WorkItemConflictError(
         `Linear work item ${item.canonicalKey} changed workspace identity`,
@@ -1645,7 +1984,7 @@ function linearKey(issue: ResolvedLinearIssue): string {
 
 function isTerminalWorkspaceFailure(error: unknown): boolean {
   return (
-    error instanceof InvalidSnapBranchError ||
+    error instanceof InvalidSnapWorkspaceInputError ||
     error instanceof SnapWorkspaceCommandError ||
     error instanceof SnapWorkspaceValidationError
   );
@@ -1692,7 +2031,15 @@ function authenticatedPromptInput(
   policy: EffectivePolicy,
   assessment: SafetyAssessment,
   execution: SafetyWrappedPromptInput["execution"],
+  systemPreflight?: Exclude<SystemPrPreflight, { mode: "workspace-failure" }>,
 ): SafetyWrappedPromptInput {
+  const sourceAction = systemPreflight
+    ? systemPreflight.mode === "test-failure-only"
+      ? "github-pr-test-failure"
+      : "github-pr-review"
+    : hasGithubReviewSubmissionAuthority(request.event)
+      ? "github-pr-review"
+      : undefined;
   return {
     requestId: request.id,
     principal: {
@@ -1701,8 +2048,21 @@ function authenticatedPromptInput(
       roleName: person.roleName,
     },
     source: request.event.source,
-    ...(hasGithubReviewSubmissionAuthority(request.event)
-      ? { sourceAction: "github-pr-review" as const }
+    ...(sourceAction ? { sourceAction } : {}),
+    ...(systemPreflight
+      ? {
+          githubReviewPreflight: {
+            mode: systemPreflight.mode,
+            reviewKey: systemPrReviewKey(request.event),
+            invocationId: systemPrInvocationId(request),
+            priorReviewArtifact: systemPreflight.priorReviewArtifact,
+            ticket: systemPreflight.workspace.ticket,
+            headSha: systemPreflight.tests.headSha,
+            suites: systemPreflight.tests.suites,
+            diagnosticTail: systemPreflight.tests.diagnosticTail,
+            urls: systemPreflight.workspace.urls,
+          },
+        }
       : {}),
     sourceDeliveryId: request.sourceDeliveryId,
     canonicalWorkItem: item.canonicalKey,
@@ -1788,11 +2148,24 @@ function hasGithubReviewSubmissionAuthority(event: WakeEvent): boolean {
   const author =
     event.kind === "pull_request.review_requested" || event.kind === "pull_request.synchronize"
       ? stringPayload(event, "author")
-      : stringPayload(event, "pullRequestAuthorLogin");
+      : event.kind === "issue_comment.created" || event.kind.startsWith("pull_request_review")
+        ? stringPayload(event, "pullRequestAuthorLogin")
+        : "";
   return (
     isGithubPullRequestEvent(event) &&
     author.length > 0 &&
     author.toLowerCase() !== DEFAULT_CHIP_IDENTITIES.githubHandle
+  );
+}
+
+function skippedSystemPrPreflight(): SystemPrPreflight | undefined {
+  return undefined;
+}
+
+function isSystemPrReviewEvent(event: WakeEvent): boolean {
+  return (
+    hasGithubReviewSubmissionAuthority(event) &&
+    stringPayload(event, "repo").toLowerCase() === "snapnhd/system"
   );
 }
 
@@ -1837,6 +2210,25 @@ function isGithubReviewStartRequest(event: WakeEvent): boolean {
   );
 }
 
+function githubReviewHeadMoved(active: WakeEvent, incoming: WakeEvent): boolean {
+  if (incoming.kind !== "pull_request.synchronize") return false;
+  const frozenHead = githubEventHeadSha(active);
+  const liveHead = githubEventHeadSha(incoming);
+  return Boolean(frozenHead && liveHead && frozenHead !== liveHead);
+}
+
+function githubSynchronizeHeadMoved(event: WakeEvent): boolean {
+  if (event.kind !== "pull_request.synchronize") return false;
+  const beforeSha = stringPayload(event, "beforeSha").trim().toLowerCase();
+  const headSha = githubEventHeadSha(event);
+  return Boolean(/^[0-9a-f]{40}$/u.test(beforeSha) && headSha && beforeSha !== headSha);
+}
+
+function githubEventHeadSha(event: WakeEvent): string | null {
+  const headSha = stringPayload(event, "headSha").trim().toLowerCase();
+  return /^[0-9a-f]{40}$/u.test(headSha) ? headSha : null;
+}
+
 function maintainedPrFeedbackKey(event: WakeEvent): string {
   const repositoryId = identifier(event.payload.repositoryId);
   const number = identifier(event.payload.number);
@@ -1844,6 +2236,15 @@ function maintainedPrFeedbackKey(event: WakeEvent): string {
     throw new Error("maintained PR feedback is missing repository id or PR number");
   }
   return `github-maintained-pr-feedback:${repositoryId}#${number}`;
+}
+
+function reviewThreadReplyKey(event: WakeEvent): string {
+  const repositoryId = identifier(event.payload.repositoryId);
+  const number = identifier(event.payload.number);
+  if (!repositoryId || !number) {
+    throw new Error("review thread reply is missing repository id or PR number");
+  }
+  return `github-review-thread-reply:${repositoryId}#${number}`;
 }
 
 function githubPullRequestUrl(event: WakeEvent): string {
@@ -1859,11 +2260,40 @@ function githubPullRequestUrl(event: WakeEvent): string {
   return repo && number ? `https://github.com/${repo}/pull/${number}` : "";
 }
 
-function trustedResumeCwd(cwd: string | null): string {
-  const candidate = cwd?.trim();
-  if (!candidate) return SNAP_ROOT;
-  const resolved = path.resolve(candidate);
-  return resolved === SNAP_ROOT || path.dirname(resolved) === SNAP_ROOT ? resolved : SNAP_ROOT;
+function systemPullRequestUrl(event: WakeEvent): string {
+  const repo = stringPayload(event, "repo").toLowerCase();
+  const number = identifier(event.payload.number);
+  if (repo !== "snapnhd/system" || !/^[1-9][0-9]*$/u.test(number)) return "";
+  return `https://github.com/snapnhd/system/pull/${number}`;
+}
+
+function systemPrReviewKey(event: WakeEvent): string {
+  const url = systemPullRequestUrl(event);
+  const number = url.match(/\/pull\/([1-9][0-9]*)$/u)?.[1];
+  if (!number) throw new PermanentError("system PR specialist proof is missing its review key");
+  return `snapnhd/system#${number}`;
+}
+
+function reviewArtifactExpectation(
+  request: AgentRequest,
+  preflight: Exclude<SystemPrPreflight, { mode: "workspace-failure" }> | undefined,
+  specialistStatus?: "PASS" | "REPAIR" | "ESCALATE",
+): GithubReviewArtifactExpectation {
+  if (!preflight) throw new PermanentError("system PR review artifact is missing its preflight");
+  return {
+    since: request.event.occurredAt,
+    expectedHeadSha: preflight.tests.headSha,
+    allowedStates:
+      preflight.mode === "test-failure-only"
+        ? ["COMMENTED"]
+        : specialistStatus === "REPAIR" || specialistStatus === "ESCALATE"
+          ? ["CHANGES_REQUESTED", "COMMENTED"]
+          : ["APPROVED", "CHANGES_REQUESTED", "COMMENTED"],
+  };
+}
+
+function systemPrInvocationId(request: AgentRequest): string {
+  return createHash("sha256").update(`${request.id}\0${request.attemptCount}`).digest("hex");
 }
 
 function supportsProgressAck(event: WakeEvent): boolean {

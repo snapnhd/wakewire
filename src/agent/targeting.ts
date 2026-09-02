@@ -50,10 +50,7 @@ export function isChipAddressed(
       );
     }
     if (isChipMaintainedPrFeedback(event, config)) return true;
-    return (
-      hasTarget(event, "handle", config.githubHandle) ||
-      hasTarget(event, "handle", config.shorthand)
-    );
+    return hasChipGithubMention(event, config);
   }
   if (event.source === "gmail") {
     // Delivery to Chip's mailbox is routing, not an invocation. Require an
@@ -99,6 +96,16 @@ export function isChipPrincipal(
 
 /** The sender-authored command. Quoted/fetched material remains untrusted later. */
 export function requestText(event: WakeEvent): string {
+  if (isChipMaintainedPrEmptyApproval(event)) {
+    const repo = stringField(event.payload, "repo");
+    const number = String(event.payload.number ?? "").trim();
+    return [
+      `An enrolled engineer approved Chip-authored PR ${repo}#${number} with no review text.`,
+      "Load pr-workflow first. Act as the PR author: never merge the PR automatically.",
+      "If GitHub is APPROVED, MERGEABLE, not behind, and required checks are green, update only the marker-owned PR Status block to 🏁 done and drop the Review: reason.",
+      "If any of those gates still fail, keep ⏸️ done blocked with a Review: line naming the remaining class.",
+    ].join(" ");
+  }
   if (isChipMaintainedPrFeedback(event)) {
     const repo = stringField(event.payload, "repo");
     const number = String(event.payload.number ?? "").trim();
@@ -107,6 +114,21 @@ export function requestText(event: WakeEvent): string {
       "Load pr-workflow first. Act as the PR author: fetch every unresolved review thread and top-level comment, fix or rebut each clear in-scope item, reply inline, resolve only concluded threads, ask the engineer when the right resolution is ambiguous, and never merge the PR automatically.",
     ].join(" ");
   }
+  if (isChipReviewThreadReply(event) && !hasChipGithubMention(event)) {
+    const repo = stringField(event.payload, "repo");
+    const number = String(event.payload.number ?? "").trim();
+    const body = stringField(event.payload, "body").trim();
+    return [
+      `An enrolled engineer replied in a GitHub review thread on ${repo}#${number} without mentioning Chip.`,
+      "Load pr-workflow first. This is a continuation of Chip's existing review conversation, not a new review request.",
+      "If they are addressing Chip \u2014 answering Chip, asking Chip, or leaving Chip a decision \u2014 reply in that same review thread.",
+      "If the comment is clearly for someone else, do not post on GitHub.",
+      "Do not post a new top-level issue comment. Do not start a fresh review round unless they asked for one.",
+      body ? `Their comment:\n${body}` : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
   const preferred =
     (event.source === "gmail" ? stringField(event.payload, "authoredBody") : "") ||
     stringField(event.payload, "body") ||
@@ -114,6 +136,33 @@ export function requestText(event: WakeEvent): string {
     stringField(event.payload, "comment") ||
     stringField(event.payload, "description");
   return preferred || event.summary;
+}
+
+/**
+ * A newly authored reply inside an existing GitHub review conversation.
+ * Parent authorship is not in the webhook; the coordinator additionally
+ * requires that Chip already has a work item for this PR.
+ */
+export function isChipReviewThreadReply(event: WakeEvent): boolean {
+  if (event.source !== "github" || event.kind !== "pull_request_review_comment.created") {
+    return false;
+  }
+  if (event.payload.isPullRequest !== true) return false;
+  if (!positiveInteger(event.payload.repositoryId) || !positiveInteger(event.payload.number)) {
+    return false;
+  }
+  if (stringField(event.payload, "senderType") !== "User") return false;
+  if (event.payload.senderAuthoredFeedback !== true) return false;
+  return positiveInteger(event.payload.inReplyToId);
+}
+
+export function hasChipGithubMention(
+  event: WakeEvent,
+  config: ChipIdentityConfig = DEFAULT_CHIP_IDENTITIES,
+): boolean {
+  return (
+    hasTarget(event, "handle", config.githubHandle) || hasTarget(event, "handle", config.shorthand)
+  );
 }
 
 export function isChipMaintainedPrFeedback(
@@ -127,12 +176,24 @@ export function isChipMaintainedPrFeedback(
   if (!equalFold(stringField(event.payload, "pullRequestAuthorLogin"), config.githubHandle)) {
     return false;
   }
-  if (event.payload.senderAuthoredFeedback !== true) return false;
   if (stringField(event.payload, "senderType") !== "User") return false;
-  return (
+  if (
     event.kind === "issue_comment.created" ||
-    event.kind === "pull_request_review_comment.created" ||
-    event.kind === "pull_request_review.submitted"
+    event.kind === "pull_request_review_comment.created"
+  ) {
+    return event.payload.senderAuthoredFeedback === true;
+  }
+  if (event.kind !== "pull_request_review.submitted") return false;
+  if (event.payload.senderAuthoredFeedback === true) return true;
+  return equalFold(stringField(event.payload, "reviewState"), "APPROVED");
+}
+
+function isChipMaintainedPrEmptyApproval(event: WakeEvent): boolean {
+  return (
+    isChipMaintainedPrFeedback(event) &&
+    event.kind === "pull_request_review.submitted" &&
+    equalFold(stringField(event.payload, "reviewState"), "APPROVED") &&
+    stringField(event.payload, "body").trim() === ""
   );
 }
 

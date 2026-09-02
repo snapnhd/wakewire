@@ -6,16 +6,21 @@ import { PeopleStore } from "../people/store.js";
 import { desktopCorrelationMarker } from "../sinks/codex-desktop.js";
 import type { AgentAdapter, DeliveryOptions, DeliveryResult } from "../sinks/types.js";
 import { CompletionWorker } from "./completion-worker.js";
-import { AgentCoordinator, AgentDispatchWorker } from "./coordinator.js";
+import {
+  AgentCoordinator,
+  AgentDispatchWorker,
+  type AgentDispatchWorkerOptions,
+} from "./coordinator.js";
+import type { GithubReviewBodyUpdate } from "./github-review-status.js";
 import type { LinearIssueDirectory } from "./linear-directory.js";
 import { ParentReportFence } from "./parent-report-fence.js";
 import { PR_ROLE_POLICY } from "./policy.js";
 import { SAFETY_POLICY_VERSION, type SafetyAssessment, type SafetyScreener } from "./safety.js";
-import { SnapWorkspaceCommandError } from "./snap-workspace.js";
+import { SnapWorkspaceCommandError, type SnapWorkspaceInput } from "./snap-workspace.js";
 import { AgentRequestStore, PROGRESS_ACK_SUPPRESSED_REASON, WorkItemStore } from "./store.js";
 
 class FakeDesktop implements AgentAdapter {
-  readonly name = "codex-desktop";
+  readonly name: string = "codex-desktop";
   calls: Array<{
     kind: "start" | "resume";
     threadId?: string;
@@ -233,6 +238,92 @@ class FakeHermes implements AgentAdapter {
   }
 }
 
+class HeadMoveHermes extends FakeHermes {
+  readonly firstDeliveryStarted: Promise<void>;
+  firstSignal: AbortSignal | undefined;
+  private signalFirstDeliveryStarted: () => void = () => {};
+  private releaseFirstDelivery: () => void = () => {};
+
+  constructor() {
+    super();
+    this.firstDeliveryStarted = new Promise((resolve) => {
+      this.signalFirstDeliveryStarted = resolve;
+    });
+  }
+
+  releaseFirst(): void {
+    this.releaseFirstDelivery();
+  }
+
+  override async deliverToThread(
+    threadId: string,
+    prompt: string,
+    opts: DeliveryOptions,
+  ): Promise<DeliveryResult> {
+    this.calls.push({ kind: "resume", threadId, prompt, opts });
+    if (this.calls.length > 1) return { threadId, finalResponse: "reviewed new head" };
+    this.firstSignal = opts.signal;
+    this.signalFirstDeliveryStarted();
+    await new Promise<void>((resolve, reject) => {
+      this.releaseFirstDelivery = resolve;
+      const onAbort = (): void => reject(opts.signal?.reason ?? new Error("aborted"));
+      opts.signal?.addEventListener("abort", onAbort, { once: true });
+      if (opts.signal?.aborted) onAbort();
+    });
+    return { threadId, finalResponse: "reviewed old head" };
+  }
+}
+
+class FinalResponseHermes extends FakeHermes {
+  constructor(private readonly response: string) {
+    super();
+  }
+
+  override async deliverToThread(
+    threadId: string,
+    prompt: string,
+    opts: DeliveryOptions,
+  ): Promise<DeliveryResult> {
+    this.calls.push({ kind: "resume", threadId, prompt, opts });
+    return { threadId, finalResponse: this.responseFor(prompt) };
+  }
+
+  override async startThread(prompt: string, opts: DeliveryOptions): Promise<DeliveryResult> {
+    this.calls.push({ kind: "start", prompt, opts });
+    return { threadId: "hermes-thread-1", finalResponse: this.responseFor(prompt) };
+  }
+
+  private responseFor(prompt: string): string {
+    const invocationId = prompt.match(/"invocationId": "([0-9a-f]{64})"/u)?.[1];
+    return invocationId
+      ? this.response.replace("<wakewire-invocation-id>", invocationId)
+      : this.response;
+  }
+}
+
+function specialistProofResponse(
+  reviewKey: string,
+  headSha: string,
+  status: "PASS" | "REPAIR" | "ESCALATE" = "PASS",
+): string {
+  return [
+    "review complete",
+    "<!-- wakewire-specialist-proof:v1",
+    JSON.stringify(
+      {
+        reviewKey,
+        headSha,
+        invocationId: "<wakewire-invocation-id>",
+        digest: "b".repeat(64),
+        status,
+      },
+      null,
+      2,
+    ),
+    "-->",
+  ].join("\n");
+}
+
 class FailingTitleDesktop extends FakeDesktop {
   titleAttempts = 0;
 
@@ -284,7 +375,7 @@ class DeferredNewDesktop implements AgentAdapter {
 }
 
 class BoundedDeferredDesktop implements AgentAdapter {
-  readonly name = "codex-desktop";
+  readonly name: string = "codex-desktop";
   readonly calls: Array<{
     kind: "start" | "resume";
     prompt: string;
@@ -394,6 +485,7 @@ function githubReviewRequestedEvent(deliveryId = "gh-rr-1"): WakeEvent {
       repo: "snapnhd/system",
       number: 1097,
       action: "review_requested",
+      author: "cswoods6",
       senderLogin: "cswoods6",
       senderId: 42786886,
     },
@@ -424,6 +516,7 @@ function githubPrCommentEvent(deliveryId = "gh-pr-comment-1"): WakeEvent {
     title: "feat(fraud): canonicalize participant role keys to uppercase (FRA-2889)",
     body: "@chipbyte-snap rereview",
     isPullRequest: true,
+    pullRequestAuthorLogin: "cswoods6",
     commentId: 5375264387,
     senderLogin: "cswoods6",
     senderId: 42786886,
@@ -434,6 +527,34 @@ function githubPrCommentEvent(deliveryId = "gh-pr-comment-1"): WakeEvent {
     replyTarget: "981891254:comment:5375264387",
   };
   return event;
+}
+
+function fakeResolvedSnapWorkspace(ticket: string, headSha = "f".repeat(40)) {
+  const normalized = ticket.toLowerCase();
+  return {
+    ticket: normalized,
+    cwd: `/Users/chip/Snap/workspaces/${normalized}`,
+    headSha,
+    urls: {
+      app: `https://${normalized}.ws.chipbyte.dev`,
+      data: `https://data-${normalized}.ws.chipbyte.dev`,
+      snapcorp: `https://snapcorp-${normalized}.ws.chipbyte.dev`,
+    },
+  };
+}
+
+function passingSnapReviewPreflight(headSha = "f".repeat(40)) {
+  return {
+    headSha,
+    passed: true,
+    suites: {
+      app: "passed" as const,
+      data: "passed" as const,
+      snapcorp: "passed" as const,
+      windmill: "passed" as const,
+    },
+    diagnosticTail: "All test suites passed!",
+  };
 }
 
 function slackThreadEvent(text: string, deliveryId: string, rootTs: string): WakeEvent {
@@ -854,6 +975,213 @@ describe("AgentCoordinator", () => {
     );
   });
 
+  it("debounces unmentioned review-thread replies on a PR Chip already joined", () => {
+    const db = openDatabase(":memory:");
+    const people = new PeopleStore(db);
+    const work = new WorkItemStore(db);
+    const requests = new AgentRequestStore(db);
+    let now = new Date("2026-09-01T18:22:00.000Z");
+    const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      now: () => now,
+      sinkAdapterName: "hermes",
+    });
+    const misael = people.add({ nickname: "Misael", roleName: "owner" });
+    people.attachIdentity({
+      personId: misael.id,
+      provider: "github",
+      tenantId: "github.com",
+      externalId: "17471",
+      handle: "misaelsnap",
+    });
+
+    const reviewRequested: WakeEvent = {
+      source: "github",
+      sourceId: "github-snapnhd-system",
+      kind: "pull_request.review_requested",
+      deliveryId: "gh-rr-1140",
+      occurredAt: now.toISOString(),
+      summary: "Review requested from chipbyte-snap",
+      payload: {
+        repo: "snapnhd/system",
+        repositoryId: 101,
+        number: 1140,
+        isPullRequest: true,
+        senderType: "User",
+        senderLogin: "misaelsnap",
+      },
+      principal: {
+        provider: "github",
+        tenantId: "github.com",
+        subjectId: "17471",
+        handle: "misaelsnap",
+      },
+      conversation: {
+        nativeKey: "101:1140",
+        rootKey: "101:1140",
+        replyTarget: "101:1140",
+      },
+      targetMentions: [{ kind: "handle", value: "chipbyte-snap" }],
+    };
+    expect(coordinator.accept(reviewRequested)).toMatchObject({
+      addressed: true,
+      accepted: true,
+    });
+
+    const reply = (deliveryId: string, commentId: number, inReplyToId: number): WakeEvent => ({
+      source: "github",
+      sourceId: "github-snapnhd-system",
+      kind: "pull_request_review_comment.created",
+      deliveryId,
+      occurredAt: now.toISOString(),
+      summary: "Review comment on snapnhd/system#1140",
+      payload: {
+        repo: "snapnhd/system",
+        repositoryId: 101,
+        number: 1140,
+        isPullRequest: true,
+        pullRequestAuthorLogin: "misaelsnap",
+        senderAuthoredFeedback: true,
+        senderType: "User",
+        senderLogin: "misaelsnap",
+        commentId,
+        inReplyToId,
+        body: "Taking you up on the rescope path.",
+      },
+      principal: {
+        provider: "github",
+        tenantId: "github.com",
+        subjectId: "17471",
+        handle: "misaelsnap",
+      },
+      conversation: {
+        nativeKey: `101:1140:comment:${commentId}`,
+        rootKey: "101:1140",
+        replyTarget: `101:comment:${commentId}`,
+      },
+    });
+
+    const first = coordinator.accept(reply("thread-1", 3907066898, 3904845832));
+    now = new Date("2026-09-01T18:22:02.000Z");
+    const second = coordinator.accept(reply("thread-2", 3907067264, 3904845853));
+    expect(first).toMatchObject({ addressed: true, accepted: true, duplicate: false });
+    expect(second).toMatchObject({ addressed: true, accepted: true, duplicate: true });
+    expect(second.requestId).toBe(first.requestId);
+    expect(requests.get(first.requestId ?? "")).toMatchObject({
+      coalesceKey: "github-review-thread-reply:101#1140",
+      nextAttemptAt: "2026-09-01T18:22:32.000Z",
+    });
+    expect(requests.get(first.requestId ?? "")?.requestText).toContain("without mentioning Chip");
+  });
+
+  it("ignores unmentioned review-thread replies on PRs Chip has never joined", () => {
+    const db = openDatabase(":memory:");
+    const people = new PeopleStore(db);
+    const work = new WorkItemStore(db);
+    const requests = new AgentRequestStore(db);
+    const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      sinkAdapterName: "hermes",
+    });
+    const misael = people.add({ nickname: "Misael", roleName: "owner" });
+    people.attachIdentity({
+      personId: misael.id,
+      provider: "github",
+      tenantId: "github.com",
+      externalId: "17471",
+      handle: "misaelsnap",
+    });
+    const reply: WakeEvent = {
+      source: "github",
+      sourceId: "github-snapnhd-system",
+      kind: "pull_request_review_comment.created",
+      deliveryId: "thread-orphan",
+      occurredAt: "2026-09-01T18:22:00.000Z",
+      summary: "Review comment on snapnhd/system#9999",
+      payload: {
+        repo: "snapnhd/system",
+        repositoryId: 101,
+        number: 9999,
+        isPullRequest: true,
+        pullRequestAuthorLogin: "misaelsnap",
+        senderAuthoredFeedback: true,
+        senderType: "User",
+        commentId: 1,
+        inReplyToId: 2,
+        body: "please look",
+      },
+      principal: {
+        provider: "github",
+        tenantId: "github.com",
+        subjectId: "17471",
+        handle: "misaelsnap",
+      },
+      conversation: {
+        nativeKey: "101:9999:comment:1",
+        rootKey: "101:9999",
+        replyTarget: "101:comment:1",
+      },
+    };
+    expect(coordinator.accept(reply)).toMatchObject({ addressed: false, accepted: false });
+    expect(requests.listReady()).toHaveLength(0);
+  });
+
+  it("accepts an empty APPROVED review on a Chip-authored pull request", () => {
+    const db = openDatabase(":memory:");
+    const people = new PeopleStore(db);
+    const work = new WorkItemStore(db);
+    const requests = new AgentRequestStore(db);
+    const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      sinkAdapterName: "hermes",
+    });
+    const approval: WakeEvent = {
+      source: "github",
+      sourceId: "github-snapnhd-system",
+      kind: "pull_request_review.submitted",
+      deliveryId: "gh-empty-approval-1158",
+      occurredAt: "2026-09-01T13:21:10.000Z",
+      summary: "Review submitted on snapnhd/system#1158",
+      payload: {
+        repo: "snapnhd/system",
+        repositoryId: 101,
+        number: 1158,
+        isPullRequest: true,
+        pullRequestAuthorLogin: "chipbyte-snap",
+        senderAuthoredFeedback: false,
+        senderType: "User",
+        senderLogin: "cj",
+        body: "",
+        reviewState: "approved",
+      },
+      principal: {
+        provider: "github",
+        tenantId: "github.com",
+        subjectId: "1819",
+        handle: "cj",
+      },
+      conversation: {
+        nativeKey: "101:1158",
+        rootKey: "101:1158",
+        replyTarget: "101:1158",
+      },
+    };
+
+    const cj = people.add({ nickname: "CJ", roleName: "owner" });
+    people.attachIdentity({
+      personId: cj.id,
+      provider: "github",
+      tenantId: "github.com",
+      externalId: "1819",
+      handle: "cj",
+    });
+    const accepted = coordinator.accept(approval);
+    expect(accepted).toMatchObject({ addressed: true, accepted: true, duplicate: false });
+    expect(requests.get(accepted.requestId ?? "")).toMatchObject({
+      coalesceKey: "github-maintained-pr-feedback:101#1158",
+    });
+    expect(requests.get(accepted.requestId ?? "")?.requestText).toContain(
+      "approved Chip-authored PR snapnhd/system#1158 with no review text",
+    );
+  });
+
   it("accepts an enrolled one-to-one Slack PM without queuing an ingress reaction", () => {
     const db = openDatabase(":memory:");
     const people = new PeopleStore(db);
@@ -896,6 +1224,7 @@ describe("AgentCoordinator", () => {
       sinkAdapterName: "hermes",
     });
     const event = githubPrCommentEvent("github-pr-high-reasoning");
+    event.payload.repo = "other/repository";
     event.payload.body =
       "> This dispatch remained fixed to low reasoning despite the high-reasoning request.\n\n@chipbyte-snap Why did this happen? Please fix it so it doesn't happen again. And run this PR with the fix";
 
@@ -923,6 +1252,87 @@ describe("AgentCoordinator", () => {
     expect(hermes.calls[0]?.prompt).not.toContain("WAKEWIRE SEPARATE TASK ORCHESTRATION");
   });
 
+  it("resumes a maintained PR session without preparing its already-running workspace", async () => {
+    const db = openDatabase(":memory:");
+    const people = new PeopleStore(db);
+    const cj = people.add({ nickname: "CJ", roleName: "owner" });
+    people.attachIdentity({
+      personId: cj.id,
+      provider: "github",
+      tenantId: "github.com",
+      externalId: "42786886",
+      handle: "cj",
+    });
+    const work = new WorkItemStore(db);
+    const requests = new AgentRequestStore(db);
+    const acceptedAt = new Date("2026-08-30T06:00:00.000Z");
+    const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      now: () => acceptedAt,
+      sinkAdapterName: "hermes",
+    });
+    const event = githubPrCommentEvent("github-maintained-pr-resume");
+    event.kind = "pull_request_review_comment.created";
+    event.summary = "Review feedback on snapnhd/system#1150";
+    event.payload = {
+      ...event.payload,
+      number: 1150,
+      title: "Scope Neon credentials to trusted provisioning (ENG-4711)",
+      body: 'This should be "system development"',
+      pullRequestAuthorLogin: "chipbyte-snap",
+      senderAuthoredFeedback: true,
+      senderType: "User",
+      senderLogin: "cj",
+      commentId: 3888115312,
+    };
+    event.conversation = {
+      nativeKey: "981891254:1150:comment:3888115312",
+      rootKey: "981891254:1150",
+      replyTarget: "981891254:comment:3888115312",
+    };
+
+    const accepted = coordinator.accept(event);
+    const request = requests.get(accepted.requestId ?? "");
+    if (!request) throw new Error("accepted request missing");
+    work.setCodexThread(request.workItemId, "existing-pr-1150-session");
+    work.setWorkspace(request.workItemId, "/Users/chip/Snap/workspaces/eng-4711");
+    const resolveWorkspace = vi.fn(async () => {
+      throw new Error("an existing PR session must not reprovision its workspace");
+    });
+    const hermes = new FakeHermes();
+    const issue = {
+      organizationId: "org-1",
+      issueId: "issue-4711",
+      identifier: "ENG-4711",
+      title: "Scope Neon credentials to trusted provisioning",
+      branchName: "eng-4711",
+    };
+    const worker = new AgentDispatchWorker(
+      people,
+      work,
+      requests,
+      {
+        resolveIdentifier: async () => issue,
+        issuesForUrl: async () => [issue],
+      },
+      hermes,
+      pino({ level: "silent" }),
+      {
+        now: () => new Date(acceptedAt.getTime() + 31_000),
+        resolveWorkspace,
+        hermesSessionLookup: () => ({ hits: [], runningIds: new Set(), cmdlineBusy: false }),
+      },
+    );
+
+    await worker.tick();
+
+    expect(resolveWorkspace).not.toHaveBeenCalled();
+    expect(hermes.calls).toEqual([
+      expect.objectContaining({ kind: "resume", threadId: "existing-pr-1150-session" }),
+    ]);
+    expect(hermes.calls[0]?.opts.cwd).toBe("/Users/chip/Snap/workspaces/eng-4711");
+    expect(requests.get(accepted.requestId ?? "")?.status).toBe("submitted");
+  });
+
   it("authorizes a formal review after an author replies to a review thread", async () => {
     const db = openDatabase(":memory:");
     const people = new PeopleStore(db);
@@ -939,6 +1349,7 @@ describe("AgentCoordinator", () => {
       sinkAdapterName: "hermes",
     });
     const event = githubPrCommentEvent("github-review-thread-fixed");
+    event.payload.repo = "other/repository";
     event.kind = "pull_request_review_comment.created";
     event.payload.pullRequestAuthorLogin = "zadams";
     event.payload.senderAuthoredFeedback = true;
@@ -959,7 +1370,7 @@ describe("AgentCoordinator", () => {
     await worker.tick();
 
     expect(hermes.calls).toHaveLength(1);
-    expect(hermes.calls[0]?.prompt).toContain("submit exactly one GitHub review");
+    expect(hermes.calls[0]?.prompt).toContain("authorizes one full review");
     expect(hermes.calls[0]?.prompt).not.toContain(
       "Do not use Slack, Gmail, Linear, GitHub, email, browser, or other connector tools",
     );
@@ -1022,7 +1433,9 @@ describe("AgentCoordinator", () => {
     const coordinator = new AgentCoordinator(people, work, requests, undefined, {
       sinkAdapterName: "hermes",
     });
-    const accepted = coordinator.accept(githubPrCommentEvent("github-pr-stale-low-profile"));
+    const event = githubPrCommentEvent("github-pr-stale-low-profile");
+    event.payload.repo = "other/repository";
+    const accepted = coordinator.accept(event);
     const requestId = accepted.requestId ?? "";
     db.prepare("UPDATE agent_requests SET execution_profile_json = ? WHERE id = ?").run(
       JSON.stringify({
@@ -1067,12 +1480,7 @@ describe("AgentCoordinator", () => {
     const requests = new AgentRequestStore(db);
     const coordinator = new AgentCoordinator(people, work, requests);
     const desktop = new FakeDesktop();
-    const resolveWorkspace = vi.fn(async () => ({
-      branch: "unused",
-      cwd: "/unused",
-      metadataPath: "/unused/.snap/workspace.env",
-      metadataValidated: true,
-    }));
+    const resolveWorkspace = vi.fn(async () => fakeResolvedSnapWorkspace("ENG-4610"));
     const screen = vi.fn(
       async (): Promise<SafetyAssessment> => ({
         policyVersion: SAFETY_POLICY_VERSION,
@@ -1170,7 +1578,7 @@ describe("AgentCoordinator", () => {
       status: "failed",
       attemptCount: 0,
       nextAttemptAt: null,
-      error: `root Makefile could not prepare workspace ${branch}`,
+      error: `workspace dispatcher could not prepare ${branch}`,
       codexThreadId: null,
       codexTurnId: null,
       correlationMarker: null,
@@ -1222,14 +1630,9 @@ describe("AgentCoordinator", () => {
     });
     const desktop = new FakeDesktop();
     let requestId = "";
-    const resolveWorkspace = vi.fn(async (branch: string) => {
+    const resolveWorkspace = vi.fn(async () => {
       expect(requests.ackForRequest(requestId)).toMatchObject({ status: "pending" });
-      return {
-        branch,
-        cwd: `/Users/chip/Snap/${branch}`,
-        metadataPath: `/Users/chip/Snap/${branch}/.snap/workspace.env`,
-        metadataValidated: true,
-      };
+      return fakeResolvedSnapWorkspace("ENG-4610");
     });
     const worker = new AgentDispatchWorker(
       people,
@@ -1472,81 +1875,81 @@ describe("AgentCoordinator", () => {
     });
   });
 
-  it.each([
-    "parent_ready",
-    "child_ready",
-  ] as const)("resumes a nondefault first-task delegation after a crash in %s", async (stage) => {
-    const db = openDatabase(":memory:");
-    const people = new PeopleStore(db);
-    const cj = people.add({ nickname: "CJ", roleName: "owner" });
-    people.attachIdentity({
-      personId: cj.id,
-      provider: "slack",
-      tenantId: "T1",
-      externalId: "U-CJ",
-    });
-    const work = new WorkItemStore(db);
-    const requests = new AgentRequestStore(db);
-    const coordinator = new AgentCoordinator(people, work, requests);
-    const desktop = new FakeDesktop();
-    const worker = new AgentDispatchWorker(
-      people,
-      work,
-      requests,
-      { resolveIdentifier: async () => null, issuesForUrl: async () => [] },
-      desktop,
-      pino({ level: "silent" }),
-    );
+  it.each(["parent_ready", "child_ready"] as const)(
+    "resumes a nondefault first-task delegation after a crash in %s",
+    async (stage) => {
+      const db = openDatabase(":memory:");
+      const people = new PeopleStore(db);
+      const cj = people.add({ nickname: "CJ", roleName: "owner" });
+      people.attachIdentity({
+        personId: cj.id,
+        provider: "slack",
+        tenantId: "T1",
+        externalId: "U-CJ",
+      });
+      const work = new WorkItemStore(db);
+      const requests = new AgentRequestStore(db);
+      const coordinator = new AgentCoordinator(people, work, requests);
+      const desktop = new FakeDesktop();
+      const worker = new AgentDispatchWorker(
+        people,
+        work,
+        requests,
+        { resolveIdentifier: async () => null, issuesForUrl: async () => [] },
+        desktop,
+        pino({ level: "silent" }),
+      );
 
-    const accepted = coordinator.accept(
-      slackDirectMessage("model: Terra; effort: high; investigate this", `retry-${stage}`),
-    );
-    const requestId = accepted.requestId ?? "";
-    const request = requests.get(requestId);
-    expect(request).not.toBeNull();
+      const accepted = coordinator.accept(
+        slackDirectMessage("model: Terra; effort: high; investigate this", `retry-${stage}`),
+      );
+      const requestId = accepted.requestId ?? "";
+      const request = requests.get(requestId);
+      expect(request).not.toBeNull();
 
-    // Simulate a daemon crash after the parent task was written to the work
-    // item, with an optional prepared child, but before child submission.
-    requests.setStatus(requestId, "dispatching");
-    requests.beginOrchestration({
-      requestId,
-      cwd: "/Users/chip/Snap",
-      sandbox: "workspace-write",
-      childPrompt: "frozen child prompt",
-      childTitle: "Slack child",
-      reportPromptPrefix: "frozen report prefix",
-      reportPromptSuffix: "frozen report suffix",
-    });
-    work.setWorkspace(request?.workItemId ?? "", "/Users/chip/Snap");
-    work.setCodexThread(request?.workItemId ?? "", "prepared-parent");
-    requests.setOrchestrationParent(requestId, "prepared-parent");
-    if (stage === "child_ready") {
-      requests.setOrchestrationChild(requestId, "prepared-child");
-    }
-    requests.setStatus(requestId, "acknowledged");
+      // Simulate a daemon crash after the parent task was written to the work
+      // item, with an optional prepared child, but before child submission.
+      requests.setStatus(requestId, "dispatching");
+      requests.beginOrchestration({
+        requestId,
+        cwd: "/Users/chip/Snap",
+        sandbox: "workspace-write",
+        childPrompt: "frozen child prompt",
+        childTitle: "Slack child",
+        reportPromptPrefix: "frozen report prefix",
+        reportPromptSuffix: "frozen report suffix",
+      });
+      work.setWorkspace(request?.workItemId ?? "", "/Users/chip/Snap");
+      work.setCodexThread(request?.workItemId ?? "", "prepared-parent");
+      requests.setOrchestrationParent(requestId, "prepared-parent");
+      if (stage === "child_ready") {
+        requests.setOrchestrationChild(requestId, "prepared-child");
+      }
+      requests.setStatus(requestId, "acknowledged");
 
-    await worker.tick();
+      await worker.tick();
 
-    const childThreadId = stage === "parent_ready" ? "prepared-thread-1" : "prepared-child";
-    expect(desktop.prepared).toHaveLength(stage === "parent_ready" ? 1 : 0);
-    expect(desktop.calls).toHaveLength(1);
-    expect(desktop.calls[0]).toMatchObject({
-      kind: "resume",
-      threadId: childThreadId,
-      prompt: "frozen child prompt",
-      opts: {
-        model: "gpt-5.6-terra",
-        reasoningEffort: "high",
-        idempotencyKey: `${requestId}:child-turn`,
-      },
-    });
-    expect(requests.orchestrationForRequest(requestId)).toMatchObject({
-      stage: "child_submitted",
-      parentThreadId: "prepared-parent",
-      childThreadId,
-    });
-    expect(requests.get(requestId)?.status).toBe("submitted");
-  });
+      const childThreadId = stage === "parent_ready" ? "prepared-thread-1" : "prepared-child";
+      expect(desktop.prepared).toHaveLength(stage === "parent_ready" ? 1 : 0);
+      expect(desktop.calls).toHaveLength(1);
+      expect(desktop.calls[0]).toMatchObject({
+        kind: "resume",
+        threadId: childThreadId,
+        prompt: "frozen child prompt",
+        opts: {
+          model: "gpt-5.6-terra",
+          reasoningEffort: "high",
+          idempotencyKey: `${requestId}:child-turn`,
+        },
+      });
+      expect(requests.orchestrationForRequest(requestId)).toMatchObject({
+        stage: "child_submitted",
+        parentThreadId: "prepared-parent",
+        childThreadId,
+      });
+      expect(requests.get(requestId)?.status).toBe("submitted");
+    },
+  );
 
   it("uses the frozen orchestration cwd when a Linear workspace resolver drifts after a crash", async () => {
     const db = openDatabase(":memory:");
@@ -1562,12 +1965,7 @@ describe("AgentCoordinator", () => {
     const requests = new AgentRequestStore(db);
     const coordinator = new AgentCoordinator(people, work, requests);
     const desktop = new FakeDesktop();
-    const resolveWorkspace = vi.fn(async (branch: string) => ({
-      branch,
-      cwd: "/Users/chip/Snap/renamed-after-crash",
-      metadataPath: "/Users/chip/Snap/renamed-after-crash/.snap/workspace.env",
-      metadataValidated: true,
-    }));
+    const resolveWorkspace = vi.fn(async () => fakeResolvedSnapWorkspace("ENG-4610"));
     const worker = new AgentDispatchWorker(
       people,
       work,
@@ -1677,12 +2075,7 @@ describe("AgentCoordinator", () => {
       })),
       issuesForUrl: vi.fn(async () => []),
     };
-    const resolveWorkspace = vi.fn(async (branch: string) => ({
-      branch,
-      cwd: `/Users/chip/Snap/${branch}`,
-      metadataPath: `/Users/chip/Snap/${branch}/.snap/workspace.env`,
-      metadataValidated: true,
-    }));
+    const resolveWorkspace = vi.fn(async () => fakeResolvedSnapWorkspace("ENG-4673"));
     const worker = new AgentDispatchWorker(
       people,
       work,
@@ -1777,12 +2170,7 @@ describe("AgentCoordinator", () => {
       issuesForUrl: vi.fn(async () => []),
     };
     const desktop = new FakeDesktop();
-    const resolveWorkspace = vi.fn(async (branch: string) => ({
-      branch,
-      cwd: `/Users/chip/Snap/${branch}`,
-      metadataPath: `/Users/chip/Snap/${branch}/.snap/workspace.env`,
-      metadataValidated: true,
-    }));
+    const resolveWorkspace = vi.fn(async () => fakeResolvedSnapWorkspace("ENG-4610"));
     const worker = new AgentDispatchWorker(
       people,
       work,
@@ -1803,10 +2191,10 @@ describe("AgentCoordinator", () => {
     expect(desktop.titles).toEqual([
       { threadId: "desktop-thread-1", title: "Linear ENG-4610 — Fix local workspace naming" },
     ]);
-    expect(resolveWorkspace).toHaveBeenCalledWith("eng-4610-fix-it", {
-      mode: "issue",
-      signal: expect.any(AbortSignal),
-    });
+    expect(resolveWorkspace).toHaveBeenCalledWith(
+      { authoritativeLinearInput: "ENG-4610" },
+      { signal: expect.any(AbortSignal) },
+    );
 
     const followUp = slackEvent("<@UCHIP> one more thing", "Ev2");
     if (!followUp.conversation) throw new Error("test event is missing conversation data");
@@ -1817,12 +2205,12 @@ describe("AgentCoordinator", () => {
     expect(desktop.calls[1]).toMatchObject({
       kind: "resume",
       threadId: "desktop-thread-1",
-      opts: { cwd: "/Users/chip/Snap/eng-4610-fix-it" },
+      opts: { cwd: "/Users/chip/Snap/workspaces/eng-4610" },
     });
     expect(desktop.calls[1]?.prompt).toMatch(/^WAKEWIRE TASK PRESENTATION - OPERATOR CONTROLLED/);
-    expect(resolveWorkspace).toHaveBeenCalledOnce();
+    expect(resolveWorkspace).toHaveBeenCalledTimes(2);
     expect(work.findCanonical("linear", "linear:org-1:issue-1")?.cwd).toBe(
-      "/Users/chip/Snap/eng-4610-fix-it",
+      "/Users/chip/Snap/workspaces/eng-4610",
     );
 
     const github: WakeEvent = {
@@ -1903,12 +2291,7 @@ describe("AgentCoordinator", () => {
       ),
     };
     const desktop = new FakeDesktop();
-    const resolveWorkspace = vi.fn(async (branch: string) => ({
-      branch,
-      cwd: `/Users/chip/Snap/${branch}`,
-      metadataPath: `/Users/chip/Snap/${branch}/.snap/workspace.env`,
-      metadataValidated: true,
-    }));
+    const resolveWorkspace = vi.fn(async () => fakeResolvedSnapWorkspace("ENG-4610"));
     const worker = new AgentDispatchWorker(
       people,
       work,
@@ -1926,10 +2309,10 @@ describe("AgentCoordinator", () => {
     ).toMatchObject({ accepted: true });
     await worker.tick();
     expect(desktop.calls[0]).toMatchObject({ kind: "start" });
-    expect(resolveWorkspace).toHaveBeenCalledWith("eng-4610-fix-it", {
-      mode: "issue",
-      signal: expect.any(AbortSignal),
-    });
+    expect(resolveWorkspace).toHaveBeenCalledWith(
+      { authoritativeLinearInput: "ENG-4610" },
+      { signal: expect.any(AbortSignal) },
+    );
 
     const github: WakeEvent = {
       source: "github",
@@ -1939,7 +2322,7 @@ describe("AgentCoordinator", () => {
       occurredAt: "2026-07-27T00:00:01.000Z",
       summary: "GitHub review comment",
       payload: {
-        repo: "snapnhd/system",
+        repo: "other/repository",
         repositoryId: 101,
         number: 42,
         isPullRequest: true,
@@ -2061,12 +2444,7 @@ describe("AgentCoordinator", () => {
       issuesForUrl: vi.fn(async () => [primary, referenced]),
     };
     const desktop = new FakeDesktop();
-    const resolveWorkspace = vi.fn(async (branch: string) => ({
-      branch,
-      cwd: `/Users/chip/Snap/${branch}`,
-      metadataPath: `/Users/chip/Snap/${branch}/.snap/workspace.env`,
-      metadataValidated: true,
-    }));
+    const resolveWorkspace = vi.fn(async () => fakeResolvedSnapWorkspace("ENG-4663"));
     const worker = new AgentDispatchWorker(
       people,
       work,
@@ -2074,7 +2452,11 @@ describe("AgentCoordinator", () => {
       directory,
       desktop,
       pino({ level: "silent" }),
-      { resolveWorkspace },
+      {
+        resolveWorkspace,
+        runReviewPreflight: async () => passingSnapReviewPreflight(),
+        reviewStatusUpdate: async (_event, update) => ({ summary: update.status.phase }),
+      },
     );
 
     const github: WakeEvent = {
@@ -2091,6 +2473,7 @@ describe("AgentCoordinator", () => {
         title: "feat(orders): route system communications to EPC contact types (ENG-4663)",
         branch: "routing-of-system-communications-when-loan-processor-eng-4663",
         isPullRequest: true,
+        pullRequestAuthorLogin: "system-pr-author",
         commentId: 3825659741,
         pullRequestUrl: "https://github.com/snapnhd/system/pull/1097",
         body: "@chipbyte-snap This seems to be different than FRA-2409 but matches flood. ENG-3859?",
@@ -2112,13 +2495,116 @@ describe("AgentCoordinator", () => {
     const accepted = coordinator.accept(github);
     expect(accepted).toMatchObject({ accepted: true });
     await worker.tick();
-    expect(requests.get(accepted.requestId ?? "")?.status).not.toBe("failed");
-    expect(requests.get(accepted.requestId ?? "")?.error).toBeFalsy();
-    expect(resolveWorkspace).toHaveBeenCalledWith(
-      "routing-of-system-communications-when-loan-processor-eng-4663",
-      { mode: "pull-request", signal: expect.any(AbortSignal) },
-    );
+    expect(requests.get(accepted.requestId ?? "")).toMatchObject({
+      status: "held",
+      error: "system PR review completion requires an immediate host-verifiable final response",
+    });
+    expect(resolveWorkspace).not.toHaveBeenCalled();
     expect(desktop.calls).toHaveLength(1);
+  });
+
+  it("binds a Linear mention to the comment's ticket when the title cites another issue", async () => {
+    const db = openDatabase(":memory:");
+    const people = new PeopleStore(db);
+    const cj = people.add({
+      nickname: "CJ",
+      roleName: "owner",
+      emails: ["cj@snapcorp.com"],
+    });
+    people.attachIdentity({
+      personId: cj.id,
+      provider: "linear",
+      tenantId: "org-1",
+      externalId: "cj-linear",
+    });
+    const work = new WorkItemStore(db);
+    const requests = new AgentRequestStore(db);
+    const coordinator = new AgentCoordinator(people, work, requests);
+    const native = {
+      organizationId: "org-1",
+      issueId: "issue-3039",
+      identifier: "FRA-3039",
+      title: "Sync app/package-lock.json with vitest/jsdom added in FRA-3017 (deploy blocker)",
+      branchName: "sync-apppackage-lockjson-with-vitestjsdom-added-in-fra-3017-fra-3039",
+    };
+    const referenced = {
+      organizationId: "org-1",
+      issueId: "issue-3017",
+      identifier: "FRA-3017",
+      title: "Add a globe-icon dev-host selector",
+      branchName: "fra-3017-dev-host-selector",
+    };
+    const directory: LinearIssueDirectory = {
+      resolveIdentifier: vi.fn(async (identifier: string) =>
+        identifier === "FRA-3039" ? native : identifier === "FRA-3017" ? referenced : null,
+      ),
+      issuesForUrl: vi.fn(async () => []),
+    };
+    const hermes = new FakeHermes();
+    const resolveWorkspace = vi.fn(async () => fakeResolvedSnapWorkspace("FRA-3039"));
+    const worker = new AgentDispatchWorker(
+      people,
+      work,
+      requests,
+      directory,
+      hermes,
+      pino({ level: "silent" }),
+      { resolveWorkspace },
+    );
+
+    const mention: WakeEvent = {
+      source: "webhook",
+      sourceId: "webhook-linear",
+      kind: "LinearUserEvent.mention",
+      deliveryId: "lin-3039",
+      occurredAt: "2026-09-01T14:54:30.748Z",
+      summary: "CJ mentioned Chip on FRA-3039",
+      payload: {
+        provider: "linear",
+        action: "create",
+        linearTrigger: "mention",
+        chipUserId: "chip-user",
+        organizationId: "org-1",
+        issueId: "issue-3039",
+        identifier: "FRA-3039",
+        title: native.title,
+        url: "https://linear.app/snapcorp/issue/FRA-3039/sync-apppackage-lockjson-with-vitestjsdom-added-in-fra-3017-deploy",
+        commentId: "comment-3039",
+        body: "@chip please review this plan",
+        actorId: "cj-linear",
+        actorEmail: "cj@snapcorp.com",
+        actorName: "CJ Lazell",
+      },
+      principal: {
+        provider: "linear",
+        tenantId: "org-1",
+        subjectId: "cj-linear",
+        email: "cj@snapcorp.com",
+        displayName: "CJ Lazell",
+      },
+      conversation: {
+        nativeKey: "org-1:issue-3039:comment:comment-3039",
+        rootKey: "org-1:issue-3039",
+        replyTarget: "issue-3039",
+      },
+      targetMentions: [{ kind: "linear-user", value: "chip-user" }],
+    };
+
+    const accepted = coordinator.accept(mention);
+    expect(accepted).toMatchObject({ accepted: true });
+    await worker.tick();
+
+    const stored = requests.get(accepted.requestId ?? "");
+    expect(stored?.status).not.toBe("failed");
+    expect(String(stored?.error ?? "")).not.toMatch(/multiple Linear issues/);
+    expect(resolveWorkspace).toHaveBeenCalledWith(
+      { authoritativeLinearInput: "FRA-3039" },
+      { signal: expect.any(AbortSignal) },
+    );
+    expect(hermes.calls).toHaveLength(1);
+    expect(work.findCanonical("linear", "linear:org-1:issue-3039")).toMatchObject({
+      canonicalKey: "linear:org-1:issue-3039",
+    });
   });
 
   it("ignores an authenticated enrolled Gmail sender unless the current message @mentions Chip", () => {
@@ -2187,12 +2673,7 @@ describe("AgentCoordinator", () => {
       issuesForUrl: vi.fn(async () => []),
     };
     const desktop = new FakeDesktop();
-    const resolveWorkspace = vi.fn(async (branch: string) => ({
-      branch,
-      cwd: `/Users/chip/Snap/${branch}`,
-      metadataPath: `/Users/chip/Snap/${branch}/.snap/workspace.env`,
-      metadataValidated: true,
-    }));
+    const resolveWorkspace = vi.fn(async () => fakeResolvedSnapWorkspace("ENG-4610"));
     const worker = new AgentDispatchWorker(
       people,
       work,
@@ -2209,13 +2690,13 @@ describe("AgentCoordinator", () => {
     await worker.tick();
 
     expect(directory.resolveIdentifier).toHaveBeenCalledWith("ENG-4610");
-    expect(resolveWorkspace).toHaveBeenCalledWith("eng-4610-fix-it", {
-      mode: "issue",
-      signal: expect.any(AbortSignal),
-    });
+    expect(resolveWorkspace).toHaveBeenCalledWith(
+      { authoritativeLinearInput: "ENG-4610" },
+      { signal: expect.any(AbortSignal) },
+    );
     expect(desktop.calls[0]).toMatchObject({
       kind: "start",
-      opts: { cwd: "/Users/chip/Snap/eng-4610-fix-it" },
+      opts: { cwd: "/Users/chip/Snap/workspaces/eng-4610" },
     });
   });
 
@@ -2344,11 +2825,15 @@ describe("AgentCoordinator", () => {
       { reviewStatusLookup, onReplyQueued },
     );
 
-    const first = coordinator.accept(githubPrCommentEvent("rereview-running-1"));
+    const firstEvent = githubPrCommentEvent("rereview-running-1");
+    firstEvent.payload.repo = "other/repository";
+    const first = coordinator.accept(firstEvent);
     const firstPass = worker.tick();
     while (hermes.calls.length === 0) await new Promise<void>((resolve) => setImmediate(resolve));
 
-    const second = coordinator.accept(githubPrCommentEvent("rereview-running-2"));
+    const secondEvent = githubPrCommentEvent("rereview-running-2");
+    secondEvent.payload.repo = "other/repository";
+    const second = coordinator.accept(secondEvent);
     await worker.tick();
 
     expect(hermes.calls).toHaveLength(1);
@@ -2358,7 +2843,7 @@ describe("AgentCoordinator", () => {
       provider: "github",
       replyKind: "issue-comment",
       payload: {
-        repo: "snapnhd/system",
+        repo: "other/repository",
         number: "1058",
         text: expect.stringContaining("📝 reviewing the diff"),
       },
@@ -2368,6 +2853,62 @@ describe("AgentCoordinator", () => {
     hermes.releaseAll();
     await firstPass;
     expect(requests.get(first.requestId ?? "")?.status).toBe("submitted");
+  });
+
+  it("completes an already-running system PR request without a second provider reply", async () => {
+    const db = openDatabase(":memory:");
+    const people = new PeopleStore(db);
+    const reviewer = people.add({ nickname: "Chris", roleName: "owner" });
+    people.attachIdentity({
+      personId: reviewer.id,
+      provider: "github",
+      tenantId: "github.com",
+      externalId: "42786886",
+      handle: "cswoods6",
+    });
+    const work = new WorkItemStore(db);
+    const requests = new AgentRequestStore(db);
+    const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      sinkAdapterName: "hermes",
+    });
+    const hermes = new BoundedDeferredHermes();
+    const reviewStatusLookup = vi.fn(async () => ({ summary: "reviewing" }));
+    const onReplyQueued = vi.fn();
+    const worker = new AgentDispatchWorker(
+      people,
+      work,
+      requests,
+      { resolveIdentifier: async () => null, issuesForUrl: async () => [] },
+      hermes,
+      pino({ level: "silent" }),
+      {
+        resolveWorkspace: async () => fakeResolvedSnapWorkspace("FRA-2889"),
+        runReviewPreflight: async () => passingSnapReviewPreflight(),
+        reviewStatusLookup,
+        reviewStatusUpdate: async (_event, update) => ({ summary: update.status.phase }),
+        onReplyQueued,
+      },
+    );
+
+    const first = coordinator.accept(githubPrCommentEvent("system-rereview-running-1"));
+    const firstPass = worker.tick();
+    while (hermes.calls.length === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const second = coordinator.accept(githubPrCommentEvent("system-rereview-running-2"));
+    await worker.tick();
+
+    expect(hermes.calls).toHaveLength(1);
+    expect(reviewStatusLookup).not.toHaveBeenCalled();
+    expect(requests.get(second.requestId ?? "")?.status).toBe("completed");
+    expect(requests.sourceReplyForRequest(second.requestId ?? "")).toBeNull();
+    expect(onReplyQueued).not.toHaveBeenCalled();
+
+    hermes.releaseAll();
+    await firstPass;
+    expect(requests.get(first.requestId ?? "")).toMatchObject({
+      status: "held",
+      error: "system PR review completion requires an immediate host-verifiable final response",
+    });
   });
 
   it("launches a later work item while another dispatch is still in flight", async () => {
@@ -2452,12 +2993,7 @@ describe("AgentCoordinator", () => {
       pino({ level: "silent" }),
       {
         maxConcurrentRequests: 2,
-        resolveWorkspace: async (branch: string) => ({
-          branch,
-          cwd: `/Users/chip/Snap/${branch}`,
-          metadataPath: `/Users/chip/Snap/${branch}/.snap/workspace.env`,
-          metadataValidated: true,
-        }),
+        resolveWorkspace: async () => fakeResolvedSnapWorkspace("ENG-4610"),
       },
     );
 
@@ -2536,14 +3072,9 @@ describe("AgentCoordinator", () => {
     let receivedSignal: AbortSignal | undefined;
     const resolveWorkspace = vi.fn(
       async (
-        _branch: string,
+        _input: SnapWorkspaceInput,
         options?: { signal?: AbortSignal | undefined },
-      ): Promise<{
-        branch: string;
-        cwd: string;
-        metadataPath: string;
-        metadataValidated: boolean;
-      }> => {
+      ): Promise<never> => {
         receivedSignal = options?.signal;
         provisioningStarted();
         await new Promise<void>((_resolve, reject) => {
@@ -2782,12 +3313,7 @@ describe("AgentCoordinator", () => {
     const requests = new AgentRequestStore(db);
     const coordinator = new AgentCoordinator(people, work, requests);
     const desktop = new FakeDesktop();
-    const resolveWorkspace = vi.fn(async (branch: string) => ({
-      branch,
-      cwd: `/Users/chip/Snap/${branch}`,
-      metadataPath: `/Users/chip/Snap/${branch}/.snap/workspace.env`,
-      metadataValidated: true,
-    }));
+    const resolveWorkspace = vi.fn(async () => fakeResolvedSnapWorkspace("ENG-4610"));
     const worker = new AgentDispatchWorker(
       people,
       work,
@@ -2856,12 +3382,7 @@ describe("AgentCoordinator", () => {
       desktop,
       pino({ level: "silent" }),
       {
-        resolveWorkspace: async (branch: string) => ({
-          branch,
-          cwd: `/Users/chip/Snap/${branch}`,
-          metadataPath: `/Users/chip/Snap/${branch}/.snap/workspace.env`,
-          metadataValidated: true,
-        }),
+        resolveWorkspace: async () => fakeResolvedSnapWorkspace("ENG-4610"),
       },
     );
 
@@ -3059,12 +3580,7 @@ describe("AgentCoordinator", () => {
       desktop,
       pino({ level: "silent" }),
       {
-        resolveWorkspace: async (branch: string) => ({
-          branch,
-          cwd: `/Users/chip/Snap/${branch}`,
-          metadataPath: `/Users/chip/Snap/${branch}/.snap/workspace.env`,
-          metadataValidated: true,
-        }),
+        resolveWorkspace: async () => fakeResolvedSnapWorkspace("ENG-4610"),
       },
     );
 
@@ -3144,12 +3660,170 @@ describe("AgentCoordinator", () => {
     await worker.tick();
 
     expect(hermes.calls).toHaveLength(0);
-    expect(requests.get(accepted.requestId ?? "")?.status).toBe("submitted");
-    expect(requests.sourceReplyForRequest(accepted.requestId ?? "")).toMatchObject({
+    expect(requests.get(accepted.requestId ?? "")?.status).toBe("completed");
+    expect(requests.sourceReplyForRequest(accepted.requestId ?? "")).toBeNull();
+  });
+
+  it("aborts only the old PR request and resumes the same session when HEAD moves", async () => {
+    const db = openDatabase(":memory:");
+    const people = new PeopleStore(db);
+    people.setRole("pr", PR_ROLE_POLICY);
+    const chris = people.add({ nickname: "Chris", roleName: "pr" });
+    people.attachIdentity({
+      personId: chris.id,
       provider: "github",
-      replyKind: "issue-comment",
-      payload: { text: expect.stringContaining("🧪 GitHub checks before sign-off") },
+      tenantId: "github.com",
+      externalId: "42786886",
+      handle: "cswoods6",
     });
+    const work = new WorkItemStore(db);
+    const requests = new AgentRequestStore(db);
+    const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      sinkAdapterName: "hermes",
+    });
+    const oldHead = "a".repeat(40);
+    const newHead = "b".repeat(40);
+    const initialEvent = githubReviewRequestedEvent("gh-running-old-head");
+    initialEvent.payload = { ...initialEvent.payload, isPullRequest: true, headSha: oldHead };
+    const initial = coordinator.accept(initialEvent);
+    const initialRequest = requests.get(initial.requestId ?? "");
+    if (!initialRequest) throw new Error("initial request missing");
+    work.setCodexThread(initialRequest.workItemId, "canonical-pr-1097-session");
+    work.setWorkspace(initialRequest.workItemId, "/Users/chip/Snap");
+
+    const hermes = new HeadMoveHermes();
+    let reportRunning = false;
+    const worker = new AgentDispatchWorker(
+      people,
+      work,
+      requests,
+      { resolveIdentifier: async () => null, issuesForUrl: async () => [] },
+      hermes,
+      pino({ level: "silent" }),
+      {
+        reviewStatusEnsure: async () => ({ summary: "pickup" }),
+        reviewCommitLookup: async () => ({
+          lastChipReviewSha: oldHead,
+          lastChipReviewState: "APPROVED",
+          lastChipReviewBody: "",
+        }),
+        hermesSessionLookup: () => ({
+          hits: [
+            {
+              id: "canonical-pr-1097-session",
+              source: "github",
+              title: "Review snapnhd/system#1097",
+              sessionKey: "wakewire:github:snapnhd/system#1097",
+              chatId: "wakewire:github:snapnhd/system#1097",
+              endedAt: null,
+              startedAt: 1,
+              firstUserMatchesRef: true,
+              firstUserRequestsReview: true,
+            },
+          ],
+          runningIds:
+            reportRunning && !hermes.firstSignal?.aborted
+              ? new Set(["canonical-pr-1097-session"])
+              : new Set<string>(),
+          cmdlineBusy: false,
+        }),
+      },
+    );
+
+    const initialPass = worker.tick();
+    await hermes.firstDeliveryStarted;
+    reportRunning = true;
+    const synchronize: WakeEvent = {
+      ...githubReviewRequestedEvent("gh-running-new-head"),
+      kind: "pull_request.synchronize",
+      payload: {
+        ...initialEvent.payload,
+        action: "synchronize",
+        beforeSha: oldHead,
+        headSha: newHead,
+        requestedReviewerLogins: ["chipbyte-snap"],
+      },
+      targetMentions: undefined,
+    };
+    const restarted = coordinator.accept(synchronize);
+    const restartPass = worker.tick();
+
+    try {
+      await vi.waitFor(() => expect(hermes.calls).toHaveLength(2));
+      expect(hermes.firstSignal?.aborted).toBe(true);
+      expect(hermes.calls.map((call) => call.threadId)).toEqual([
+        "canonical-pr-1097-session",
+        "canonical-pr-1097-session",
+      ]);
+      expect(requests.get(initial.requestId ?? "")).toMatchObject({
+        status: "failed",
+        error: expect.stringContaining("superseded by PR HEAD"),
+      });
+      expect(requests.get(restarted.requestId ?? "")?.status).toBe("completed");
+    } finally {
+      hermes.releaseFirst();
+      await Promise.allSettled([initialPass, restartPass]);
+    }
+  });
+
+  it("does not abort or submit a second turn for a duplicate same-HEAD synchronize", async () => {
+    const db = openDatabase(":memory:");
+    const people = new PeopleStore(db);
+    people.setRole("pr", PR_ROLE_POLICY);
+    const chris = people.add({ nickname: "Chris", roleName: "pr" });
+    people.attachIdentity({
+      personId: chris.id,
+      provider: "github",
+      tenantId: "github.com",
+      externalId: "42786886",
+      handle: "cswoods6",
+    });
+    const work = new WorkItemStore(db);
+    const requests = new AgentRequestStore(db);
+    const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      sinkAdapterName: "hermes",
+    });
+    const headSha = "a".repeat(40);
+    const initialEvent = githubReviewRequestedEvent("gh-running-same-head");
+    initialEvent.payload = { ...initialEvent.payload, isPullRequest: true, headSha };
+    const initial = coordinator.accept(initialEvent);
+    const initialRequest = requests.get(initial.requestId ?? "");
+    if (!initialRequest) throw new Error("initial request missing");
+    work.setCodexThread(initialRequest.workItemId, "canonical-pr-1097-session");
+    work.setWorkspace(initialRequest.workItemId, "/Users/chip/Snap");
+    const hermes = new HeadMoveHermes();
+    const worker = new AgentDispatchWorker(
+      people,
+      work,
+      requests,
+      { resolveIdentifier: async () => null, issuesForUrl: async () => [] },
+      hermes,
+      pino({ level: "silent" }),
+      { reviewStatusEnsure: async () => ({ summary: "pickup" }) },
+    );
+
+    const initialPass = worker.tick();
+    await hermes.firstDeliveryStarted;
+    const synchronize: WakeEvent = {
+      ...githubReviewRequestedEvent("gh-running-same-head-sync"),
+      kind: "pull_request.synchronize",
+      payload: {
+        ...initialEvent.payload,
+        action: "synchronize",
+        beforeSha: headSha,
+        headSha,
+        requestedReviewerLogins: ["chipbyte-snap"],
+      },
+      targetMentions: undefined,
+    };
+    const duplicate = coordinator.accept(synchronize);
+    await worker.tick();
+
+    expect(hermes.calls).toHaveLength(1);
+    expect(hermes.firstSignal?.aborted).not.toBe(true);
+    expect(requests.get(duplicate.requestId ?? "")?.status).toBe("completed");
+    hermes.releaseFirst();
+    await initialPass;
   });
 
   it("holds a timed-out review retry while its prior process is still running", async () => {
@@ -3202,7 +3876,7 @@ describe("AgentCoordinator", () => {
     });
   });
 
-  it("uses the pull-request workspace contract for a new PR rereview comment", async () => {
+  it("orders pickup, ticket workspace, exact-head tests, then the full system PR review", async () => {
     const db = openDatabase(":memory:");
     const people = new PeopleStore(db);
     people.setRole("pr", PR_ROLE_POLICY);
@@ -3223,68 +3897,29 @@ describe("AgentCoordinator", () => {
     const coordinator = new AgentCoordinator(people, work, requests, undefined, {
       sinkAdapterName: "hermes",
     });
-    const hermes = new FakeHermes();
-    const resolveWorkspace = vi.fn(async (branch: string) => ({
-      branch,
-      cwd: `/Users/chip/Snap/${branch}`,
-      metadataPath: `/Users/chip/Snap/${branch}/.snap/workspace.env`,
-      metadataValidated: true,
-    }));
-    const worker = new AgentDispatchWorker(
-      people,
-      work,
-      requests,
-      {
-        resolveIdentifier: async () => ({
-          organizationId: "org-1",
-          issueId: "issue-2889",
-          identifier: "FRA-2889",
-          title: "Canonicalize participant role keys",
-          branchName: "canonicalize-participant-role-keys-to-encompass-form-fra-2889",
-        }),
-        issuesForUrl: async () => [],
-      },
-      hermes,
-      pino({ level: "silent" }),
-      { resolveWorkspace },
-    );
-
-    const accepted = coordinator.accept(githubPrCommentEvent("gh-rereview-new"));
-    await worker.tick();
-
-    expect(resolveWorkspace).toHaveBeenCalledWith(
-      "canonicalize-participant-role-keys-to-encompass-form-fra-2889",
-      expect.objectContaining({ mode: "pull-request" }),
-    );
-    expect(hermes.calls).toHaveLength(1);
-    expect(requests.get(accepted.requestId ?? "")?.status).toBe("submitted");
-  });
-
-  it("resumes a matching PR session before attempting workspace preparation", async () => {
-    const db = openDatabase(":memory:");
-    const people = new PeopleStore(db);
-    people.setRole("pr", PR_ROLE_POLICY);
-    const chris = people.add({
-      nickname: "Chris",
-      roleName: "pr",
-      emails: ["chris@snapcorp.com"],
-    });
-    people.attachIdentity({
-      personId: chris.id,
-      provider: "github",
-      tenantId: "github.com",
-      externalId: "42786886",
-      handle: "cswoods6",
-    });
-    const work = new WorkItemStore(db);
-    const requests = new AgentRequestStore(db);
-    const coordinator = new AgentCoordinator(people, work, requests, undefined, {
-      sinkAdapterName: "hermes",
-    });
-    const hermes = new FakeHermes();
+    const headSha = "a".repeat(40);
+    const hermes = new FinalResponseHermes(specialistProofResponse("snapnhd/system#1097", headSha));
+    const order: string[] = [];
+    const statusUpdates: GithubReviewBodyUpdate[] = [];
     const resolveWorkspace = vi.fn(async () => {
-      throw new Error("workspace preparation must not run before session reuse");
+      order.push("workspace");
+      return fakeResolvedSnapWorkspace("FRA-2889", headSha);
     });
+    const runReviewPreflight = vi.fn(async () => {
+      order.push("tests");
+      return passingSnapReviewPreflight(headSha);
+    });
+    const reviewStatusEnsure = vi.fn(async () => {
+      order.push("pickup");
+      return { summary: "👀 picked up", url: "https://github.com/snapnhd/system/pull/1097" };
+    });
+    const reviewStatusUpdate: NonNullable<
+      AgentDispatchWorkerOptions["reviewStatusUpdate"]
+    > = async (_event, update) => {
+      order.push(update.status.phase);
+      statusUpdates.push(update);
+      return { summary: update.status.phase, url: "https://github.com/snapnhd/system/pull/1097" };
+    };
     const worker = new AgentDispatchWorker(
       people,
       work,
@@ -3303,6 +3938,584 @@ describe("AgentCoordinator", () => {
       pino({ level: "silent" }),
       {
         resolveWorkspace,
+        runReviewPreflight,
+        reviewStatusEnsure,
+        reviewStatusUpdate,
+        specialistProofLookup: async () => true,
+        reviewArtifactLookup: async () => true,
+      },
+    );
+
+    const event = githubReviewRequestedEvent("gh-review-preflight-order");
+    event.payload.title = "Canonicalize participant role keys (FRA-2889)";
+    event.payload.pullRequestUrl = "https://github.com/snapnhd/system/pull/9999";
+    const accepted = coordinator.accept(event);
+    await worker.tick();
+
+    expect(resolveWorkspace).not.toHaveBeenCalled();
+    expect(runReviewPreflight).not.toHaveBeenCalled();
+    expect(order).toEqual(["pickup"]);
+    expect(hermes.calls).toHaveLength(1);
+    expect(hermes.calls[0]?.opts.cwd).toBe("/Users/chip/Snap");
+    expect(requests.get(accepted.requestId ?? "")?.status).toBe("completed");
+  });
+
+  it("holds a full system PR review comment when the exact-head specialist proof is missing", async () => {
+    const db = openDatabase(":memory:");
+    const people = new PeopleStore(db);
+    people.setRole("pr", PR_ROLE_POLICY);
+    const reviewer = people.add({ nickname: "Chris", roleName: "pr" });
+    people.attachIdentity({
+      personId: reviewer.id,
+      provider: "github",
+      tenantId: "github.com",
+      externalId: "42786886",
+    });
+    const work = new WorkItemStore(db);
+    const requests = new AgentRequestStore(db);
+    const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      sinkAdapterName: "hermes",
+    });
+    const hermes = new FinalResponseHermes("review complete");
+    const headSha = "a".repeat(40);
+    const phases: string[] = [];
+    const specialistProofLookup = vi.fn(async () => true);
+    const worker = new AgentDispatchWorker(
+      people,
+      work,
+      requests,
+      { resolveIdentifier: async () => null, issuesForUrl: async () => [] },
+      hermes,
+      pino({ level: "silent" }),
+      {
+        resolveWorkspace: async () => fakeResolvedSnapWorkspace("FRA-2889", headSha),
+        runReviewPreflight: async () => passingSnapReviewPreflight(headSha),
+        reviewStatusEnsure: async () => ({ summary: "pickup" }),
+        reviewStatusUpdate: async (_event, update) => {
+          phases.push(update.status.phase);
+          return { summary: update.status.phase };
+        },
+        specialistProofLookup,
+      },
+    );
+    const accepted = coordinator.accept(githubPrCommentEvent("gh-comment-missing-proof"));
+
+    await worker.tick();
+
+    expect(specialistProofLookup).not.toHaveBeenCalled();
+    expect(requests.get(accepted.requestId ?? "")).toMatchObject({
+      status: "completed",
+      error: null,
+    });
+    expect(phases).not.toContain("specialists-incomplete");
+  });
+
+  it("holds a full system PR review when no review artifact can be verified", async () => {
+    const db = openDatabase(":memory:");
+    const people = new PeopleStore(db);
+    people.setRole("pr", PR_ROLE_POLICY);
+    const reviewer = people.add({ nickname: "Chris", roleName: "pr" });
+    people.attachIdentity({
+      personId: reviewer.id,
+      provider: "github",
+      tenantId: "github.com",
+      externalId: "42786886",
+    });
+    const work = new WorkItemStore(db);
+    const requests = new AgentRequestStore(db);
+    const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      sinkAdapterName: "hermes",
+    });
+    const headSha = "a".repeat(40);
+    const hermes = new FinalResponseHermes(specialistProofResponse("snapnhd/system#1097", headSha));
+    const phases: string[] = [];
+    const worker = new AgentDispatchWorker(
+      people,
+      work,
+      requests,
+      { resolveIdentifier: async () => null, issuesForUrl: async () => [] },
+      hermes,
+      pino({ level: "silent" }),
+      {
+        resolveWorkspace: async () => fakeResolvedSnapWorkspace("FRA-2889", headSha),
+        runReviewPreflight: async () => passingSnapReviewPreflight(headSha),
+        reviewStatusEnsure: async () => ({ summary: "pickup" }),
+        reviewStatusUpdate: async (_event, update) => {
+          phases.push(update.status.phase);
+          return { summary: update.status.phase };
+        },
+        specialistProofLookup: async () => true,
+        reviewArtifactLookup: async () => false,
+      },
+    );
+    const accepted = coordinator.accept(githubReviewRequestedEvent("gh-review-missing-artifact"));
+
+    await worker.tick();
+
+    expect(requests.get(accepted.requestId ?? "")).toMatchObject({
+      status: "completed",
+      error: null,
+    });
+    expect(phases).not.toContain("review-incomplete");
+  });
+
+  it.each([
+    ["REPAIR" as const, "specialist changes required"],
+    ["ESCALATE" as const, "specialist reconciliation required"],
+  ])("leaves a trusted %s specialist verdict visibly waiting", async (status, _detail) => {
+    const db = openDatabase(":memory:");
+    const people = new PeopleStore(db);
+    people.setRole("pr", PR_ROLE_POLICY);
+    const reviewer = people.add({ nickname: "Chris", roleName: "pr" });
+    people.attachIdentity({
+      personId: reviewer.id,
+      provider: "github",
+      tenantId: "github.com",
+      externalId: "42786886",
+    });
+    const work = new WorkItemStore(db);
+    const requests = new AgentRequestStore(db);
+    const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      sinkAdapterName: "hermes",
+    });
+    const headSha = "a".repeat(40);
+    const hermes = new FinalResponseHermes(
+      specialistProofResponse("snapnhd/system#1097", headSha, status),
+    );
+    const updates: GithubReviewBodyUpdate[] = [];
+    const worker = new AgentDispatchWorker(
+      people,
+      work,
+      requests,
+      { resolveIdentifier: async () => null, issuesForUrl: async () => [] },
+      hermes,
+      pino({ level: "silent" }),
+      {
+        resolveWorkspace: async () => fakeResolvedSnapWorkspace("FRA-2889", headSha),
+        runReviewPreflight: async () => passingSnapReviewPreflight(headSha),
+        reviewStatusEnsure: async () => ({ summary: "pickup" }),
+        reviewStatusUpdate: async (_event, update) => {
+          updates.push(update);
+          return { summary: update.status.phase };
+        },
+        specialistProofLookup: async () => true,
+        reviewArtifactLookup: async () => true,
+      },
+    );
+    const accepted = coordinator.accept(githubReviewRequestedEvent(`gh-review-${status}`));
+
+    await worker.tick();
+
+    expect(requests.get(accepted.requestId ?? "")?.status).toBe("completed");
+    expect(updates.some((update) => update.status.phase === "specialists-waiting")).toBe(false);
+  });
+
+  it("recovers a held proof attempt without submitting a duplicate GitHub review", async () => {
+    const db = openDatabase(":memory:");
+    const people = new PeopleStore(db);
+    people.setRole("pr", PR_ROLE_POLICY);
+    const reviewer = people.add({ nickname: "Chris", roleName: "pr" });
+    people.attachIdentity({
+      personId: reviewer.id,
+      provider: "github",
+      tenantId: "github.com",
+      externalId: "42786886",
+    });
+    const work = new WorkItemStore(db);
+    const requests = new AgentRequestStore(db);
+    const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      sinkAdapterName: "hermes",
+    });
+    const headSha = "a".repeat(40);
+    const hermes = new FinalResponseHermes(specialistProofResponse("snapnhd/system#1097", headSha));
+    const reviewArtifactLookup = vi.fn(async () => true);
+    const worker = new AgentDispatchWorker(
+      people,
+      work,
+      requests,
+      { resolveIdentifier: async () => null, issuesForUrl: async () => [] },
+      hermes,
+      pino({ level: "silent" }),
+      {
+        now: () => new Date("2026-08-27T20:00:00.000Z"),
+        resolveWorkspace: async () => fakeResolvedSnapWorkspace("FRA-2889", headSha),
+        runReviewPreflight: async () => passingSnapReviewPreflight(headSha),
+        reviewStatusEnsure: async () => ({ summary: "pickup" }),
+        reviewStatusUpdate: async (_event, update) => ({ summary: update.status.phase }),
+        specialistProofLookup: async () => true,
+        reviewArtifactLookup,
+      },
+    );
+    const accepted = coordinator.accept(githubReviewRequestedEvent("gh-review-proof-recovery"));
+    requests.hold(
+      accepted.requestId ?? "",
+      "system PR review did not produce a trusted exact-head specialist proof",
+      "2026-08-27T19:59:59.000Z",
+    );
+
+    await worker.tick();
+
+    expect(hermes.calls).toHaveLength(1);
+    expect(reviewArtifactLookup).not.toHaveBeenCalled();
+    expect(requests.get(accepted.requestId ?? "")?.status).toBe("completed");
+  });
+
+  it.each([undefined, "chipbyte-snap"])(
+    "does not enter system review preflight with PR author %s",
+    async (author) => {
+      const db = openDatabase(":memory:");
+      const people = new PeopleStore(db);
+      people.setRole("pr", PR_ROLE_POLICY);
+      const reviewer = people.add({ nickname: "Chris", roleName: "pr" });
+      people.attachIdentity({
+        personId: reviewer.id,
+        provider: "github",
+        tenantId: "github.com",
+        externalId: "42786886",
+      });
+      const work = new WorkItemStore(db);
+      const requests = new AgentRequestStore(db);
+      const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+        sinkAdapterName: "hermes",
+      });
+      const hermes = new FakeHermes();
+      const resolveWorkspace = vi.fn(async () => fakeResolvedSnapWorkspace("FRA-2889"));
+      const runReviewPreflight = vi.fn(async () => passingSnapReviewPreflight());
+      const worker = new AgentDispatchWorker(
+        people,
+        work,
+        requests,
+        { resolveIdentifier: async () => null, issuesForUrl: async () => [] },
+        hermes,
+        pino({ level: "silent" }),
+        {
+          resolveWorkspace,
+          runReviewPreflight,
+          reviewStatusEnsure: async () => ({ summary: "pickup" }),
+          reviewStatusUpdate: async (_event, update) => ({ summary: update.status.phase }),
+        },
+      );
+      const event = githubReviewRequestedEvent(`gh-review-author-${author ?? "missing"}`);
+      if (author === undefined) delete event.payload.author;
+      else event.payload.author = author;
+
+      const accepted = coordinator.accept(event);
+      await worker.tick();
+
+      expect(resolveWorkspace).not.toHaveBeenCalled();
+      expect(runReviewPreflight).not.toHaveBeenCalled();
+      expect(hermes.calls).toHaveLength(1);
+      expect(hermes.calls[0]?.prompt).not.toContain("authorizes one full review");
+      expect(requests.get(accepted.requestId ?? "")?.status).toBe("completed");
+    },
+  );
+
+  it("dispatches only limited COMMENTED triage when one local suite fails", async () => {
+    const db = openDatabase(":memory:");
+    const people = new PeopleStore(db);
+    people.setRole("pr", PR_ROLE_POLICY);
+    const reviewer = people.add({ nickname: "Chris", roleName: "pr" });
+    people.attachIdentity({
+      personId: reviewer.id,
+      provider: "github",
+      tenantId: "github.com",
+      externalId: "42786886",
+    });
+    const work = new WorkItemStore(db);
+    const requests = new AgentRequestStore(db);
+    const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      sinkAdapterName: "hermes",
+    });
+    const hermes = new FakeHermes();
+    const headSha = "b".repeat(40);
+    const resolveWorkspace = vi.fn(async () => fakeResolvedSnapWorkspace("FRA-2889", headSha));
+    const runReviewPreflight = vi.fn(async () => ({
+      headSha,
+      passed: true,
+      suites: {
+        app: "test-failed" as const,
+        data: "passed" as const,
+        snapcorp: "passed" as const,
+        windmill: "passed" as const,
+      },
+      diagnosticTail: "app: TEST FAILED (exit code 1)",
+    }));
+    const specialistProofLookup = vi.fn(async () => false);
+    const worker = new AgentDispatchWorker(
+      people,
+      work,
+      requests,
+      {
+        resolveIdentifier: async () => ({
+          organizationId: "org-1",
+          issueId: "issue-2889",
+          identifier: "FRA-2889",
+        }),
+        issuesForUrl: async () => [],
+      },
+      hermes,
+      pino({ level: "silent" }),
+      {
+        resolveWorkspace,
+        runReviewPreflight,
+        reviewStatusEnsure: async () => ({ summary: "pickup" }),
+        reviewStatusUpdate: async (_event, update) => ({ summary: update.status.phase }),
+        reviewArtifactLookup: async () => true,
+        specialistProofLookup,
+      },
+    );
+    const event = githubReviewRequestedEvent("gh-review-preflight-failed");
+    event.payload.title = "Canonicalize participant role keys (FRA-2889)";
+
+    const accepted = coordinator.accept(event);
+    await worker.tick();
+
+    expect(runReviewPreflight).not.toHaveBeenCalled();
+    expect(hermes.calls).toHaveLength(1);
+    expect(hermes.calls[0]?.opts.cwd).toBe("/Users/chip/Snap");
+    expect(specialistProofLookup).not.toHaveBeenCalled();
+    expect(requests.get(accepted.requestId ?? "")?.status).toBe("completed");
+  });
+
+  it("rejects a frozen full-review child after a fresh preflight fails", async () => {
+    const db = openDatabase(":memory:");
+    const people = new PeopleStore(db);
+    people.setRole("pr", PR_ROLE_POLICY);
+    const reviewer = people.add({ nickname: "Chris", roleName: "pr" });
+    people.attachIdentity({
+      personId: reviewer.id,
+      provider: "github",
+      tenantId: "github.com",
+      externalId: "42786886",
+    });
+    const work = new WorkItemStore(db);
+    const requests = new AgentRequestStore(db);
+    const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      sinkAdapterName: "hermes",
+    });
+    class HermesDesktop extends FakeDesktop {
+      override readonly name = "hermes";
+    }
+    const desktop = new HermesDesktop();
+    const headSha = "9".repeat(40);
+    const worker = new AgentDispatchWorker(
+      people,
+      work,
+      requests,
+      {
+        resolveIdentifier: async () => ({
+          organizationId: "org-1",
+          issueId: "issue-2889",
+          identifier: "FRA-2889",
+        }),
+        issuesForUrl: async () => [],
+      },
+      desktop,
+      pino({ level: "silent" }),
+      {
+        resolveWorkspace: async () => fakeResolvedSnapWorkspace("FRA-2889", headSha),
+        runReviewPreflight: async () => ({
+          headSha,
+          passed: false,
+          suites: {
+            app: "test-failed",
+            data: "passed",
+            snapcorp: "passed",
+            windmill: "passed",
+          },
+          diagnosticTail: "app: TEST FAILED",
+        }),
+        reviewStatusEnsure: async () => ({ summary: "pickup" }),
+        reviewStatusUpdate: async (_event, update) => ({ summary: update.status.phase }),
+      },
+    );
+    const event = githubReviewRequestedEvent("gh-review-stale-orchestration");
+    event.payload.title = "Canonicalize participant role keys (FRA-2889)";
+    event.payload.body = "Use a separate task for this review.";
+    const accepted = coordinator.accept(event);
+    expect(accepted).toMatchObject({ accepted: true });
+    const requestId = accepted.requestId ?? "";
+    const request = requests.get(requestId);
+    if (!request) throw new Error("request was not created");
+    requests.setStatus(requestId, "dispatching");
+    requests.beginOrchestration({
+      requestId,
+      cwd: "/Users/chip/Snap/workspaces/fra-2889",
+      sandbox: "read-only",
+      childPrompt: "FULL-REVIEW at stale HEAD",
+      childTitle: "stale child",
+      reportPromptPrefix: "stale report prefix",
+      reportPromptSuffix: "stale report suffix",
+    });
+    requests.setStatus(requestId, "acknowledged");
+
+    await worker.tick();
+
+    expect(desktop.prepared).toHaveLength(0);
+    expect(desktop.calls).toHaveLength(0);
+    expect(requests.get(requestId)).toMatchObject({
+      status: "failed",
+      error: expect.stringContaining("already has different separate-task orchestration"),
+    });
+  });
+
+  it("does not run Snap workspace or local-test preflight for a non-system PR", async () => {
+    const db = openDatabase(":memory:");
+    const people = new PeopleStore(db);
+    people.setRole("pr", PR_ROLE_POLICY);
+    const reviewer = people.add({ nickname: "Chris", roleName: "pr" });
+    people.attachIdentity({
+      personId: reviewer.id,
+      provider: "github",
+      tenantId: "github.com",
+      externalId: "42786886",
+    });
+    const work = new WorkItemStore(db);
+    const requests = new AgentRequestStore(db);
+    const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      sinkAdapterName: "hermes",
+    });
+    const hermes = new FakeHermes();
+    const resolveWorkspace = vi.fn();
+    const runReviewPreflight = vi.fn();
+    const worker = new AgentDispatchWorker(
+      people,
+      work,
+      requests,
+      { resolveIdentifier: async () => null, issuesForUrl: async () => [] },
+      hermes,
+      pino({ level: "silent" }),
+      {
+        resolveWorkspace,
+        runReviewPreflight,
+        reviewStatusEnsure: async () => ({ summary: "pickup" }),
+      },
+    );
+    const event = githubReviewRequestedEvent("gh-non-system-review");
+    event.payload.repo = "other/repository";
+    event.conversation = {
+      nativeKey: "other/repository:1097",
+      rootKey: "other/repository:1097",
+      replyTarget: "other/repository:1097",
+    };
+
+    coordinator.accept(event);
+    await worker.tick();
+
+    expect(resolveWorkspace).not.toHaveBeenCalled();
+    expect(runReviewPreflight).not.toHaveBeenCalled();
+    expect(hermes.calls).toHaveLength(1);
+    expect(hermes.calls[0]?.opts.cwd).toBe("/Users/chip/Snap");
+  });
+
+  it("does not boot a managed workspace or stamp workspace-failed for a system PR review", async () => {
+    const db = openDatabase(":memory:");
+    const people = new PeopleStore(db);
+    people.setRole("pr", PR_ROLE_POLICY);
+    const reviewer = people.add({ nickname: "Chris", roleName: "pr" });
+    people.attachIdentity({
+      personId: reviewer.id,
+      provider: "github",
+      tenantId: "github.com",
+      externalId: "42786886",
+    });
+    const work = new WorkItemStore(db);
+    const requests = new AgentRequestStore(db);
+    const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      sinkAdapterName: "hermes",
+    });
+    const hermes = new FakeHermes();
+    const phases: string[] = [];
+    const resolveWorkspace = vi.fn(async () => {
+      throw new Error("root Makefile could not prepare workspace fra-2950");
+    });
+    const runReviewPreflight = vi.fn();
+    const worker = new AgentDispatchWorker(
+      people,
+      work,
+      requests,
+      {
+        resolveIdentifier: async () => ({
+          organizationId: "org-1",
+          issueId: "issue-2950",
+          identifier: "FRA-2950",
+        }),
+        issuesForUrl: async () => [],
+      },
+      hermes,
+      pino({ level: "silent" }),
+      {
+        resolveWorkspace,
+        runReviewPreflight,
+        reviewStatusEnsure: async () => ({ summary: "pickup" }),
+        reviewStatusUpdate: async (_event, update) => {
+          phases.push(update.status.phase);
+          return { summary: update.status.phase };
+        },
+      },
+    );
+    const event = githubReviewRequestedEvent("gh-system-review-no-workspace");
+    event.payload.title = "fix(fraud): REO owner-search alerts (FRA-2950)";
+
+    const accepted = coordinator.accept(event);
+    await worker.tick();
+
+    expect(resolveWorkspace).not.toHaveBeenCalled();
+    expect(runReviewPreflight).not.toHaveBeenCalled();
+    expect(phases).not.toContain("workspace-starting");
+    expect(phases).not.toContain("workspace-failed");
+    expect(hermes.calls).toHaveLength(1);
+    expect(hermes.calls[0]?.opts.cwd).toBe("/Users/chip/Snap");
+    expect(requests.get(accepted.requestId ?? "")?.status).toBe("completed");
+  });
+
+  it("revalidates the exact workspace and tests before resuming a matching PR session", async () => {
+    const db = openDatabase(":memory:");
+    const people = new PeopleStore(db);
+    people.setRole("pr", PR_ROLE_POLICY);
+    const chris = people.add({
+      nickname: "Chris",
+      roleName: "pr",
+      emails: ["chris@snapcorp.com"],
+    });
+    people.attachIdentity({
+      personId: chris.id,
+      provider: "github",
+      tenantId: "github.com",
+      externalId: "42786886",
+      handle: "cswoods6",
+    });
+    const work = new WorkItemStore(db);
+    const requests = new AgentRequestStore(db);
+    const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      sinkAdapterName: "hermes",
+    });
+    const headSha = "c".repeat(40);
+    const hermes = new FinalResponseHermes(specialistProofResponse("snapnhd/system#1058", headSha));
+    const resolveWorkspace = vi.fn(async () => fakeResolvedSnapWorkspace("FRA-2889", headSha));
+    const runReviewPreflight = vi.fn(async () => passingSnapReviewPreflight(headSha));
+    const worker = new AgentDispatchWorker(
+      people,
+      work,
+      requests,
+      {
+        resolveIdentifier: async () => ({
+          organizationId: "org-1",
+          issueId: "issue-2889",
+          identifier: "FRA-2889",
+          title: "Canonicalize participant role keys",
+          branchName: "canonicalize-participant-role-keys-to-encompass-form-fra-2889",
+        }),
+        issuesForUrl: async () => [],
+      },
+      hermes,
+      pino({ level: "silent" }),
+      {
+        resolveWorkspace,
+        runReviewPreflight,
+        reviewStatusUpdate: async (_event, update) => ({ summary: update.status.phase }),
+        specialistProofLookup: async () => true,
+        reviewArtifactLookup: async () => true,
         hermesSessionLookup: () => ({
           hits: [
             {
@@ -3339,11 +4552,13 @@ describe("AgentCoordinator", () => {
     await worker.tick();
 
     expect(resolveWorkspace).not.toHaveBeenCalled();
+    expect(runReviewPreflight).not.toHaveBeenCalled();
     expect(hermes.calls).toEqual([
       expect.objectContaining({ kind: "resume", threadId: "20260821_125620_1a8606" }),
     ]);
     expect(hermes.calls[0]?.opts.cwd).toBe("/Users/chip/Snap");
-    expect(requests.get(accepted.requestId ?? "")?.status).toBe("submitted");
+    expect(requests.get(accepted.requestId ?? "")?.status).toBe("completed");
+    expect(requests.sourceReplyForRequest(accepted.requestId ?? "")).toBeNull();
   });
 
   it("resumes the existing Hermes session instead of starting a second review", async () => {
@@ -3367,7 +4582,9 @@ describe("AgentCoordinator", () => {
     const coordinator = new AgentCoordinator(people, work, requests, undefined, {
       sinkAdapterName: "hermes",
     });
-    const hermes = new FakeHermes();
+    const headSha = "d".repeat(40);
+    const hermes = new FinalResponseHermes(specialistProofResponse("snapnhd/system#1097", headSha));
+    const resolveWorkspace = vi.fn(async () => fakeResolvedSnapWorkspace("FRA-2889", headSha));
     const worker = new AgentDispatchWorker(
       people,
       work,
@@ -3376,6 +4593,12 @@ describe("AgentCoordinator", () => {
       hermes,
       pino({ level: "silent" }),
       {
+        resolveWorkspace,
+        runReviewPreflight: async () => passingSnapReviewPreflight(headSha),
+        reviewStatusEnsure: async () => ({ summary: "pickup" }),
+        reviewStatusUpdate: async (_event, update) => ({ summary: update.status.phase }),
+        specialistProofLookup: async () => true,
+        reviewArtifactLookup: async () => true,
         hermesSessionLookup: () => ({
           hits: [
             {
@@ -3401,6 +4624,8 @@ describe("AgentCoordinator", () => {
     expect(hermes.calls).toEqual([
       expect.objectContaining({ kind: "resume", threadId: "20260820_151904_399713" }),
     ]);
+    expect(resolveWorkspace).not.toHaveBeenCalled();
+    expect(hermes.calls[0]?.opts.cwd).toBe("/Users/chip/Snap");
     expect(requests.get(accepted.requestId ?? "")?.codexThreadId).toBe("20260820_151904_399713");
   });
 
@@ -3425,11 +4650,13 @@ describe("AgentCoordinator", () => {
     const coordinator = new AgentCoordinator(people, work, requests, undefined, {
       sinkAdapterName: "hermes",
     });
-    const hermes = new FakeHermes();
     const reviewStatusEnsure = vi.fn(async () => ({
-      summary: "👀 picked up — reading the ticket",
-      url: "https://github.com/snapnhd/system/pull/1110#issuecomment-1",
+      summary: "👀 picked up",
+      url: "https://github.com/snapnhd/system/pull/1110",
     }));
+    const headSha = "e".repeat(40);
+    const hermes = new FinalResponseHermes(specialistProofResponse("snapnhd/system#1110", headSha));
+    const resolveWorkspace = vi.fn(async () => fakeResolvedSnapWorkspace("FRA-2872", headSha));
     const worker = new AgentDispatchWorker(
       people,
       work,
@@ -3445,8 +4672,12 @@ describe("AgentCoordinator", () => {
       hermes,
       pino({ level: "silent" }),
       {
-        reviewArtifactLookup: async () => false,
+        resolveWorkspace,
+        runReviewPreflight: async () => passingSnapReviewPreflight(headSha),
+        reviewArtifactLookup: async () => true,
         reviewStatusEnsure: reviewStatusEnsure,
+        reviewStatusUpdate: async (_event, update) => ({ summary: update.status.phase }),
+        specialistProofLookup: async () => true,
       },
     );
     const event = githubReviewRequestedEvent("gh-rr-linear-down");
@@ -3464,11 +4695,9 @@ describe("AgentCoordinator", () => {
     expect(hermes.calls).toHaveLength(1);
     expect(hermes.calls[0]?.kind).toBe("start");
     expect(reviewStatusEnsure).toHaveBeenCalledOnce();
-    expect(requests.get(accepted.requestId ?? "")?.status).toBe("submitted");
-    expect(requests.sourceReplyForRequest(accepted.requestId ?? "")).toMatchObject({
-      provider: "github",
-      replyKind: "issue-comment",
-      payload: { text: "plan drafted" },
-    });
+    expect(resolveWorkspace).not.toHaveBeenCalled();
+    expect(hermes.calls[0]?.opts.cwd).toBe("/Users/chip/Snap");
+    expect(requests.get(accepted.requestId ?? "")?.status).toBe("completed");
+    expect(requests.sourceReplyForRequest(accepted.requestId ?? "")).toBeNull();
   });
 });

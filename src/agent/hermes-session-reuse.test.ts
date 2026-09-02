@@ -121,6 +121,34 @@ describe("decideHermesSessionReuse", () => {
     });
   });
 
+  it("supersedes a running review only when the frozen PR head moved", () => {
+    const running = {
+      ref: PR,
+      boundSessionId: "20260820_151904_399713",
+      hits: [hit({ id: "20260820_151904_399713" })],
+      runningIds: new Set(["20260820_151904_399713"]),
+      cmdlineBusy: false,
+      reviewRequest: true,
+    };
+
+    expect(decideHermesSessionReuse({ ...running, headMoved: false })).toEqual({
+      action: "ignore",
+      sessionId: "20260820_151904_399713",
+      reason: "running",
+    });
+    expect(decideHermesSessionReuse({ ...running, headMoved: true })).toEqual({
+      action: "supersede",
+      sessionId: "20260820_151904_399713",
+    });
+    expect(
+      decideHermesSessionReuse({ ...running, reviewRequest: false, headMoved: false }),
+    ).toEqual({
+      action: "hold",
+      sessionId: "20260820_151904_399713",
+      reason: "running",
+    });
+  });
+
   it("holds non-review turns while the matching session is running", () => {
     expect(
       decideHermesSessionReuse({
@@ -188,6 +216,34 @@ describe("decideHermesSessionReuse", () => {
         cmdlineBusy: false,
       }),
     ).toEqual({ action: "resume", sessionId: "dedicated-pr-session" });
+  });
+
+  it("creates instead of resuming a WorkItem binding whose session_key belongs to a different PR", () => {
+    expect(
+      decideHermesSessionReuse({
+        ref: { githubRepo: "snapnhd/system", githubNumber: "1143", linearIdentifier: "FRA-2950" },
+        boundSessionId: "20260901_081632_af5dcf13",
+        boundSessionKey: "wakewire:github:snapnhd/system#1157",
+        boundChatId: "wakewire:github:snapnhd/system#1157",
+        hits: [],
+        runningIds: new Set(),
+        cmdlineBusy: false,
+      }),
+    ).toEqual({ action: "create" });
+  });
+
+  it("does not treat a foreign-keyed bound session as already running", () => {
+    expect(
+      decideHermesSessionReuse({
+        ref: { githubRepo: "snapnhd/system", githubNumber: "1143" },
+        boundSessionId: "20260901_081632_af5dcf13",
+        boundSessionKey: "wakewire:github:snapnhd/system#1157",
+        hits: [],
+        runningIds: new Set(["20260901_081632_af5dcf13"]),
+        cmdlineBusy: false,
+        reviewRequest: true,
+      }),
+    ).toEqual({ action: "create" });
   });
 
   it("resumes the oldest open session when a crash minted a newer duplicate", () => {
@@ -369,6 +425,71 @@ describe("defaultHermesSessionLookup", () => {
       expect(
         found.hits.find((candidate) => candidate.id === "diagnostic")?.firstUserRequestsReview,
       ).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not treat another PR's keyed session as a hit because a user message listed this PR", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "ww-hermes-foreign-key-"));
+    const dbPath = path.join(dir, "state.db");
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        source TEXT,
+        title TEXT,
+        session_key TEXT,
+        chat_id TEXT,
+        ended_at REAL,
+        started_at REAL,
+        archived INTEGER DEFAULT 0
+      );
+      CREATE TABLE messages (
+        id INTEGER PRIMARY KEY,
+        session_id TEXT,
+        role TEXT,
+        content TEXT,
+        timestamp REAL,
+        active INTEGER DEFAULT 1
+      );
+    `);
+    db.prepare(
+      `INSERT INTO sessions (id, source, title, session_key, chat_id, ended_at, started_at)
+       VALUES (?, 'github', ?, ?, ?, NULL, ?)`,
+    ).run(
+      "20260901_081632_af5dcf13",
+      "snapnhd/system#1157 · feat(fraud): show transfer history on Potential...",
+      "wakewire:github:snapnhd/system#1157",
+      "wakewire:github:snapnhd/system#1157",
+      1_000,
+    );
+    db.prepare(
+      `INSERT INTO messages (session_id, role, content, timestamp)
+       VALUES (?, 'user', ?, 1001)`,
+    ).run(
+      "20260901_081632_af5dcf13",
+      [
+        "Open Fraud PR Status — 23 open fraud PRs",
+        "https://github.com/snapnhd/system/pull/1157 FRA-2803",
+        "https://github.com/snapnhd/system/pull/1143 FRA-2950",
+        "snapnhd/system#1148 snapnhd/system#1152",
+      ].join("\n"),
+    );
+    db.close();
+
+    try {
+      const foreign = defaultHermesSessionLookup(
+        { githubRepo: "snapnhd/system", githubNumber: "1143", linearIdentifier: "FRA-2950" },
+        { dbPath, nowSeconds: 2_000, psArgs: "" },
+      );
+      expect(foreign.hits.map((hit) => hit.id)).toEqual([]);
+
+      const owner = defaultHermesSessionLookup(
+        { githubRepo: "snapnhd/system", githubNumber: "1157", linearIdentifier: "FRA-2803" },
+        { dbPath, nowSeconds: 2_000, psArgs: "" },
+      );
+      expect(owner.hits.map((hit) => hit.id)).toEqual(["20260901_081632_af5dcf13"]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -50,16 +50,19 @@ export class HermesAgentAdapter implements AgentAdapter {
 
   async startThread(prompt: string, opts: DeliveryOptions): Promise<DeliveryResult> {
     const stamp = requireHermesStamp(opts);
-    const result = await this.invoke({
-      action: "start",
-      prompt,
-      ...stampToRunnerBody(stamp),
-      cwd: opts.cwd,
-      timeoutSeconds: this.config.defaultTimeoutSeconds ?? 1500,
-      hermesBin: this.config.hermesBin,
-      profile: this.config.profile,
-      sessionId: null,
-    });
+    const result = await this.invoke(
+      {
+        action: "start",
+        prompt,
+        ...stampToRunnerBody(stamp),
+        cwd: opts.cwd,
+        timeoutSeconds: this.config.defaultTimeoutSeconds ?? 1500,
+        hermesBin: this.config.hermesBin,
+        profile: this.config.profile,
+        sessionId: null,
+      },
+      opts.signal,
+    );
     return { threadId: result.sessionId, finalResponse: result.finalResponse };
   }
 
@@ -69,16 +72,19 @@ export class HermesAgentAdapter implements AgentAdapter {
     opts: DeliveryOptions,
   ): Promise<DeliveryResult> {
     const stamp = requireHermesStamp(opts);
-    const result = await this.invoke({
-      action: "resume",
-      prompt,
-      ...stampToRunnerBody(stamp),
-      cwd: opts.cwd,
-      timeoutSeconds: this.config.defaultTimeoutSeconds ?? 1500,
-      hermesBin: this.config.hermesBin,
-      profile: this.config.profile,
-      sessionId: threadId,
-    });
+    const result = await this.invoke(
+      {
+        action: "resume",
+        prompt,
+        ...stampToRunnerBody(stamp),
+        cwd: opts.cwd,
+        timeoutSeconds: this.config.defaultTimeoutSeconds ?? 1500,
+        hermesBin: this.config.hermesBin,
+        profile: this.config.profile,
+        sessionId: threadId,
+      },
+      opts.signal,
+    );
     return { threadId: result.sessionId || threadId, finalResponse: result.finalResponse };
   }
 
@@ -122,12 +128,12 @@ export class HermesAgentAdapter implements AgentAdapter {
     }
   }
 
-  private async invoke(body: Record<string, unknown>): Promise<RunnerOk> {
+  private async invoke(body: Record<string, unknown>, signal?: AbortSignal): Promise<RunnerOk> {
     const timeoutMs = Math.max(
       5_000,
       (Number(body.timeoutSeconds) || this.config.defaultTimeoutSeconds || 1500) * 1000 + 5_000,
     );
-    const parsed = await this.invokeRaw(body, timeoutMs);
+    const parsed = await this.invokeRaw(body, timeoutMs, signal);
     if (!parsed.ok) {
       const message = parsed.message || "hermes runner failed";
       if (parsed.errorClass === "busy") throw new BusyError(message);
@@ -140,7 +146,12 @@ export class HermesAgentAdapter implements AgentAdapter {
     return parsed;
   }
 
-  private invokeRaw(body: Record<string, unknown>, timeoutMs: number): Promise<RunnerResult> {
+  private invokeRaw(
+    body: Record<string, unknown>,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<RunnerResult> {
+    signal?.throwIfAborted();
     const runner = this.config.runnerPath ?? DEFAULT_RUNNER;
     const python =
       this.config.hermesPython ??
@@ -157,6 +168,11 @@ export class HermesAgentAdapter implements AgentAdapter {
       });
       let stdout = "";
       let stderr = "";
+      let abortReason: unknown;
+      const onAbort = (): void => {
+        abortReason = signal?.reason ?? new Error("hermes runner aborted");
+        child.kill("SIGTERM");
+      };
       const timer = setTimeout(() => {
         child.kill("SIGKILL");
         reject(new UnreachableError(`hermes runner timed out after ${timeoutMs}ms`));
@@ -169,10 +185,16 @@ export class HermesAgentAdapter implements AgentAdapter {
       });
       child.on("error", (err) => {
         clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
         reject(new UnreachableError(`hermes runner spawn failed: ${err.message}`));
       });
       child.on("close", (code) => {
         clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        if (abortReason) {
+          reject(abortReason);
+          return;
+        }
         const line = stdout
           .split("\n")
           .map((l) => l.trim())
@@ -217,6 +239,8 @@ export class HermesAgentAdapter implements AgentAdapter {
           );
         }
       });
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
       child.stdin.end(JSON.stringify(body));
     });
   }
