@@ -105,6 +105,39 @@ describe("trimGithubEvent — pull_request / issues / fallback", () => {
     });
   });
 
+  it("trims synchronize head SHAs and requested reviewer logins", () => {
+    const headSha = "1234567890abcdef1234567890abcdef12345678";
+    const beforeSha = "abcdef1234567890abcdef1234567890abcdef12";
+    const event = trimGithubEvent({
+      eventName: "pull_request",
+      deliveryId: "d-synchronize",
+      payload: {
+        action: "synchronize",
+        before: beforeSha,
+        after: headSha,
+        number: 42,
+        repository: { full_name: "snapnhd/system" },
+        pull_request: {
+          number: 42,
+          title: "Restacked review",
+          user: { login: "zadams" },
+          head: { ref: "fra-3039", sha: headSha },
+          requested_reviewers: [{ login: "ChipByte-Snap" }, { login: "OTHER-REVIEWER" }],
+        },
+      },
+    });
+
+    expect(event?.payload).toMatchObject({
+      number: 42,
+      repo: "snapnhd/system",
+      isPullRequest: true,
+      author: "zadams",
+      headSha,
+      beforeSha,
+      requestedReviewerLogins: ["chipbyte-snap", "other-reviewer"],
+    });
+  });
+
   it("normalizes a Chip review request while preserving the outside sender", () => {
     const event = trimGithubEvent({
       eventName: "pull_request",

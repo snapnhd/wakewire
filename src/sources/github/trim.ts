@@ -352,6 +352,19 @@ function trimPullRequest(args: {
   const author = isRecord(pr.user) && typeof pr.user.login === "string" ? pr.user.login : "unknown";
   const url = typeof pr.html_url === "string" ? pr.html_url : "";
   const headBranch = isRecord(pr.head) && typeof pr.head.ref === "string" ? pr.head.ref : "";
+  const headSha =
+    isRecord(pr.head) && typeof pr.head.sha === "string"
+      ? pr.head.sha
+      : typeof payload.after === "string"
+        ? payload.after
+        : "";
+  const beforeSha = typeof payload.before === "string" ? payload.before : "";
+  const requestedReviewerLogins = (Array.isArray(pr.requested_reviewers)
+    ? pr.requested_reviewers
+    : []
+  )
+    .map((reviewer) => (isRecord(reviewer) ? stringOf(reviewer.login).trim().toLowerCase() : ""))
+    .filter(Boolean);
   const baseBranch = isRecord(pr.base) && typeof pr.base.ref === "string" ? pr.base.ref : "";
   const body = truncate(typeof pr.body === "string" ? pr.body : "", 1000);
   return {
@@ -368,6 +381,10 @@ function trimPullRequest(args: {
       author,
       url,
       branch: headBranch,
+      isPullRequest: true,
+      ...(headSha ? { headSha } : {}),
+      ...(beforeSha ? { beforeSha } : {}),
+      ...(requestedReviewerLogins.length > 0 ? { requestedReviewerLogins } : {}),
       baseBranch,
       // A review_requested action is the command. Keep the older PR body only
       // as provider context so requestText cannot promote it to the command.
