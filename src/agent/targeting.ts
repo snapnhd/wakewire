@@ -96,6 +96,21 @@ export function isChipPrincipal(
 
 /** The sender-authored command. Quoted/fetched material remains untrusted later. */
 export function requestText(event: WakeEvent): string {
+  if (event.source === "github" && event.kind === "pull_request.synchronize") {
+    const repo = stringField(event.payload, "repo");
+    const number = String(event.payload.number ?? "").trim();
+    const headSha = stringField(event.payload, "headSha");
+    return [
+      `Pull request ${repo}#${number} moved to live HEAD ${headSha}.`,
+      "Load pr-workflow first.",
+      "Live HEAD changed; the last Chip review SHA, if any, does not cover it.",
+      "Abort/ignore old-SHA clone work; do not reset the old clone.",
+      `Create or reuse only workspaces/pr-${number}-review-${headSha}.`,
+      "Invalidate tests, correctness, and specialist results from the previous SHA.",
+      "Write pickup on the new HEAD immediately.",
+      "Submit one formal review for the new HEAD; do not treat the prior APPROVE/COMMENT as covering it.",
+    ].join(" ");
+  }
   if (isChipMaintainedPrEmptyApproval(event)) {
     const repo = stringField(event.payload, "repo");
     const number = String(event.payload.number ?? "").trim();

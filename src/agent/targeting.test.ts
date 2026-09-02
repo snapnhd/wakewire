@@ -189,6 +189,34 @@ describe("Chip targeting", () => {
     expect(isChipAddressed(chipSender)).toBe(true);
   });
 
+  it("prompts a synchronize turn as a restart on the new HEAD", () => {
+    const headSha = "b".repeat(40);
+    const prompt = requestText(
+      event({
+        kind: "pull_request.synchronize",
+        payload: {
+          repo: "snapnhd/system",
+          number: 1165,
+          headSha,
+        },
+      }),
+    );
+
+    expect(prompt).toContain("Load pr-workflow first");
+    expect(prompt).toContain(
+      "Live HEAD changed; the last Chip review SHA, if any, does not cover it",
+    );
+    expect(prompt).toContain("Abort/ignore old-SHA clone work; do not reset the old clone");
+    expect(prompt).toContain(`Create or reuse only workspaces/pr-1165-review-${headSha}`);
+    expect(prompt).toContain(
+      "Invalidate tests, correctness, and specialist results from the previous SHA",
+    );
+    expect(prompt).toContain("Write pickup on the new HEAD immediately");
+    expect(prompt).toContain(
+      "Submit one formal review for the new HEAD; do not treat the prior APPROVE/COMMENT as covering it",
+    );
+  });
+
   it("auto-targets new engineer feedback only on Chip-authored pull requests", () => {
     const maintained = (kind: string, payload: Record<string, unknown> = {}) =>
       event({

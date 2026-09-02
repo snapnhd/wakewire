@@ -310,6 +310,33 @@ describe("buildSafetyWrappedPrompt", () => {
     );
   });
 
+  it("protects existing SHA-named review clones while allowing the scoped lock restore", () => {
+    const prompt = buildSafetyWrappedPrompt({
+      ...baseInput,
+      source: "github",
+      sourceAction: "github-pr-review",
+      rolePolicy: { destructiveActions: "deny" },
+      presentation: {
+        title: "GitHub PR snapnhd/system#1165 — review",
+        description: "GitHub PR snapnhd/system#1165 — review",
+      },
+      assessment: {
+        policyVersion: SAFETY_POLICY_VERSION,
+        decision: "allow",
+        mode: "local-model-placeholder",
+        enforcing: false,
+        reasonCodes: ["local-model-not-configured"],
+      },
+    });
+
+    expect(prompt).toContain(
+      "git reset, force-pull, and checkout -B of an existing SHA-named clone are forbidden",
+    );
+    expect(prompt).toContain(
+      "Restoring a sibling lockfile not present in the GitHub diff is allowed, as scoped for Task 9",
+    );
+  });
+
   it("reserves Gmail response delivery for WakeWire's final-reply outbox", () => {
     const prompt = buildSafetyWrappedPrompt({
       ...baseInput,

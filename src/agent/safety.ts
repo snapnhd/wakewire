@@ -360,6 +360,8 @@ function inSessionExactHeadReviewRules(): string[] {
     "- Host exact-head preflight was skipped. Create or reuse the SHA-named isolated review clone, run make secrets and make test there, then review.",
     "- Role stamps filesystem/shell/git=read and secrets.use=false forbid push, history rewrite, deleting shared trees, mutating the default system checkout, and printing secrets. They do not forbid that isolated clone, fetching the PR and base refs into it, checking out a hostname-safe local branch at the exact head OID, or running make secrets/make test there.",
     "- Creating that clone is a permitted create, not a destructive git write. A missing commit in the shared default checkout is not a blocker. Do not stop to ask for clone permission.",
+    "- git reset, force-pull, and checkout -B of an existing SHA-named clone are forbidden.",
+    "- Restoring a sibling lockfile not present in the GitHub diff is allowed, as scoped for Task 9.",
     "- Clone-root make test may DROP/CREATE those harness-gated local *_test databases. Do not refuse make test as a database reset.",
   ];
 }
