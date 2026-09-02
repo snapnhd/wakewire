@@ -936,6 +936,7 @@ describe("AgentCoordinator", () => {
     };
     const hermes = new FakeHermes();
     const reviewCommitLookup = vi.fn(async () => reviewEvidence);
+    const reviewStatusUpdate = vi.fn(async () => ({ summary: "pickup" }));
     const worker = new AgentDispatchWorker(
       people,
       work,
@@ -946,6 +947,7 @@ describe("AgentCoordinator", () => {
       {
         now: () => now,
         reviewCommitLookup,
+        reviewStatusUpdate,
         hermesSessionLookup: () => ({ hits: [], runningIds: new Set(), cmdlineBusy: false }),
       },
     );
@@ -969,6 +971,8 @@ describe("AgentCoordinator", () => {
     expect(hermes.calls).toEqual([
       expect.objectContaining({ kind: "resume", threadId: "wakewire-pr-1124" }),
     ]);
+    expect(reviewStatusUpdate).toHaveBeenCalledTimes(1);
+    expect(requests.get(processMiss.requestId ?? "")?.status).toBe("completed");
 
     reviewEvidence = null;
     const unrequested = coordinator.accept(synchronize("sync-no-review", false));
@@ -3776,6 +3780,8 @@ describe("AgentCoordinator", () => {
     work.setWorkspace(initialRequest.workItemId, "/Users/chip/Snap");
 
     const hermes = new HeadMoveHermes();
+    const pickupUpdates: GithubReviewBodyUpdate[] = [];
+    const pickupHermesCallCounts: number[] = [];
     let reportRunning = false;
     const worker = new AgentDispatchWorker(
       people,
@@ -3787,6 +3793,11 @@ describe("AgentCoordinator", () => {
       {
         now: () => now,
         reviewStatusEnsure: async () => ({ summary: "pickup" }),
+        reviewStatusUpdate: async (_event, update) => {
+          pickupUpdates.push(update);
+          pickupHermesCallCounts.push(hermes.calls.length);
+          return { summary: "pickup" };
+        },
         reviewCommitLookup: async () => ({
           lastChipReviewSha: oldHead,
           lastChipReviewState: "APPROVED",
@@ -3841,6 +3852,17 @@ describe("AgentCoordinator", () => {
         "canonical-pr-1097-session",
         "canonical-pr-1097-session",
       ]);
+      expect(pickupUpdates).toEqual([
+        {
+          expectedHeadSha: newHead,
+          status: {
+            phase: "pickup",
+            updatedAt: "2026-09-02T14:00:31.000Z",
+            headSha: newHead,
+          },
+        },
+      ]);
+      expect(pickupHermesCallCounts).toEqual([1]);
       expect(requests.get(initial.requestId ?? "")).toMatchObject({
         status: "failed",
         error: expect.stringContaining("superseded by PR HEAD"),

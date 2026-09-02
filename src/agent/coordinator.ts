@@ -23,11 +23,12 @@ import {
   type ExecutionReasoningEffort,
   parseExecutionProfile,
 } from "./execution-profile.js";
-import type {
-  GithubReviewArtifactExpectation,
-  GithubReviewBodyUpdate,
-  GithubReviewStatusPhase,
-  GithubReviewTestState,
+import {
+  githubReviewHeadMovePickupUpdate,
+  type GithubReviewArtifactExpectation,
+  type GithubReviewBodyUpdate,
+  type GithubReviewStatusPhase,
+  type GithubReviewTestState,
 } from "./github-review-status.js";
 import { chipReviewCoversHead, type ChipReviewCommit } from "./github-review-head.js";
 import { buildHermesSessionOptions, hermesTargetFromEvent } from "./hermes-identity.js";
@@ -963,6 +964,20 @@ export class AgentDispatchWorker {
     }
     if (request.event.kind === "pull_request.review_requested") {
       const status = await this.reviewStatusEnsure(request.event, signal);
+      if (systemPrReview && !status) {
+        throw new Error("system PR pickup status could not be verified in the pull request body");
+      }
+    } else if (request.event.kind === "pull_request.synchronize") {
+      const pickup = githubReviewHeadMovePickupUpdate(
+        request.event,
+        this.now().toISOString(),
+      );
+      if (!pickup) throw new Error("PR synchronize is missing one exact full HEAD SHA");
+      const status = await this.reviewStatusUpdate(
+        request.event,
+        pickup,
+        signal,
+      );
       if (systemPrReview && !status) {
         throw new Error("system PR pickup status could not be verified in the pull request body");
       }

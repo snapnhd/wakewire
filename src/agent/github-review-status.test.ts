@@ -5,7 +5,27 @@ import {
   createGithubReviewArtifactLookup,
   createGithubReviewStatusEnsure,
   extractGithubReviewStatus,
+  githubReviewHeadMovePickupUpdate,
 } from "./github-review-status.js";
+
+describe("githubReviewHeadMovePickupUpdate", () => {
+  it("builds pickup status for the exact synchronized HEAD", () => {
+    const headSha = "b".repeat(40);
+    const event: WakeEvent = {
+      source: "github",
+      kind: "pull_request.synchronize",
+      deliveryId: "sync-1113",
+      occurredAt: "2026-09-02T14:00:31.000Z",
+      summary: "PR HEAD moved",
+      payload: { repo: "snapnhd/system", number: 1113, headSha },
+    };
+
+    expect(githubReviewHeadMovePickupUpdate(event, event.occurredAt)).toEqual({
+      expectedHeadSha: headSha,
+      status: { phase: "pickup", updatedAt: event.occurredAt, headSha },
+    });
+  });
+});
 
 describe("extractGithubReviewStatus", () => {
   it("returns the live stage from Chip's status bar", () => {

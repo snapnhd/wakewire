@@ -14,6 +14,21 @@ export const CHIP_REVIEW_STATUS_PICKUP_BODY = `${STATUS_MARKER}
 👀 pickup → 🎫 ticket → 🧵 threads → 📝 diff → 💬 comments → 🧪 checks → ✅ done
 `;
 
+export function githubReviewHeadMovePickupUpdate(event: WakeEvent, updatedAt: string) {
+  const headSha = event.payload.headSha;
+  if (
+    event.kind !== "pull_request.synchronize" ||
+    typeof headSha !== "string" ||
+    !/^[0-9a-f]{40}$/u.test(headSha)
+  ) {
+    return null;
+  }
+  return {
+    expectedHeadSha: headSha,
+    status: { phase: "pickup" as const, updatedAt, headSha },
+  };
+}
+
 interface GithubIssueComment {
   body?: string | undefined;
   html_url?: string | undefined;
