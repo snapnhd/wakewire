@@ -144,6 +144,51 @@ describe("Chip targeting", () => {
     ).toBe(true);
   });
 
+  it("addresses requested third-party PR synchronize events", () => {
+    const synchronize = event({
+      kind: "pull_request.synchronize",
+      payload: {
+        repo: "snapnhd/system",
+        number: 1165,
+        isPullRequest: true,
+        author: "zadams",
+        requestedReviewerLogins: ["chipbyte-snap"],
+      },
+      principal: {
+        provider: "github",
+        tenantId: "github.com",
+        subjectId: "17470",
+        handle: "zadams",
+      },
+    });
+
+    expect(isChipAddressed(synchronize)).toBe(true);
+    expect(
+      isChipAddressed({
+        ...synchronize,
+        payload: { ...synchronize.payload, requestedReviewerLogins: ["someone-else"] },
+      }),
+    ).toBe(false);
+    expect(
+      isChipAddressed({
+        ...synchronize,
+        payload: { ...synchronize.payload, author: "chipbyte-snap" },
+      }),
+    ).toBe(false);
+
+    const chipSender = {
+      ...synchronize,
+      principal: {
+        provider: "github" as const,
+        tenantId: "github.com",
+        subjectId: "1",
+        handle: "chipbyte-snap",
+      },
+    };
+    expect(isChipPrincipal(chipSender)).toBe(true);
+    expect(isChipAddressed(chipSender)).toBe(true);
+  });
+
   it("auto-targets new engineer feedback only on Chip-authored pull requests", () => {
     const maintained = (kind: string, payload: Record<string, unknown> = {}) =>
       event({

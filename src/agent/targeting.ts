@@ -37,6 +37,18 @@ export function isChipAddressed(
     if (event.kind === "pull_request.review_requested") {
       return hasTarget(event, "handle", config.githubHandle);
     }
+    if (event.kind === "pull_request.synchronize") {
+      const author = stringField(event.payload, "author");
+      const requestedReviewers = Array.isArray(event.payload.requestedReviewerLogins)
+        ? event.payload.requestedReviewerLogins
+        : [];
+      return (
+        !equalFold(author, config.githubHandle) &&
+        requestedReviewers.some(
+          (reviewer) => typeof reviewer === "string" && equalFold(reviewer, config.githubHandle),
+        )
+      );
+    }
     if (isChipMaintainedPrFeedback(event, config)) return true;
     return (
       hasTarget(event, "handle", config.githubHandle) ||
