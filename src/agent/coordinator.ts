@@ -136,7 +136,21 @@ export class AgentCoordinator {
   }
 
   accept(event: WakeEvent): AgentAcceptance {
-    return this.acceptAddressed(event, isChipAddressed(event, this.chip));
+    let addressed = isChipAddressed(event, this.chip);
+    if (!addressed && event.source === "github" && event.kind === "pull_request.synchronize") {
+      const author = stringPayload(event, "author").trim().toLowerCase();
+      const state = stringPayload(event, "state").trim().toLowerCase();
+      const eligibleJoinedPr =
+        author !== this.chip.githubHandle.trim().toLowerCase() &&
+        state !== "closed" &&
+        event.payload.merged !== true;
+      addressed =
+        eligibleJoinedPr &&
+        correlationAliases(event, "").some(
+          (alias) => this.workItems.findByAlias("correlation", alias.kind, alias.key) !== null,
+        );
+    }
+    return this.acceptAddressed(event, addressed);
   }
 
   /**

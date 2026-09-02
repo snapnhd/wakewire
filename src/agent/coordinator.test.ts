@@ -590,6 +590,84 @@ describe("AgentCoordinator", () => {
     expect(coordinator.accept(slackEvent("<@UCHIP> do it"))).toMatchObject({ duplicate: true });
   });
 
+  it("accepts synchronize for an enrolled PR work item after Chip is no longer requested", () => {
+    const db = openDatabase(":memory:");
+    const people = new PeopleStore(db);
+    const work = new WorkItemStore(db);
+    const requests = new AgentRequestStore(db);
+    const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      sinkAdapterName: "hermes",
+    });
+    const zack = people.add({ nickname: "Zack", roleName: "owner" });
+    people.attachIdentity({
+      personId: zack.id,
+      provider: "github",
+      tenantId: "github.com",
+      externalId: "17470",
+      handle: "zadams",
+    });
+    const synchronize = (deliveryId: string, payload: Record<string, unknown> = {}): WakeEvent => ({
+      source: "github",
+      sourceId: "github-snapnhd-system",
+      kind: "pull_request.synchronize",
+      deliveryId,
+      occurredAt: "2026-09-02T14:00:00.000Z",
+      summary: "PR #1124 synchronized on snapnhd/system",
+      payload: {
+        repo: "snapnhd/system",
+        repositoryId: 101,
+        number: 1124,
+        isPullRequest: true,
+        author: "zadams",
+        requestedReviewerLogins: [],
+        headSha: "1234567890abcdef1234567890abcdef12345678",
+        ...payload,
+      },
+      principal: {
+        provider: "github",
+        tenantId: "github.com",
+        subjectId: "17470",
+        handle: "zadams",
+      },
+      conversation: {
+        nativeKey: "101:1124",
+        rootKey: "101:1124",
+        replyTarget: "101:1124",
+      },
+    });
+
+    expect(coordinator.accept(synchronize("sync-without-work-item"))).toMatchObject({
+      addressed: false,
+      accepted: false,
+    });
+
+    const item = work.getOrCreate({
+      kind: "github",
+      key: "github:101:pull-request:1124",
+      title: "GitHub PR snapnhd/system#1124",
+    });
+    work.attachAlias(item.id, {
+      provider: "correlation",
+      scope: "github",
+      nativeKey: "github:101:pull-request:1124",
+    });
+
+    expect(coordinator.accept(synchronize("sync-with-work-item"))).toMatchObject({
+      addressed: true,
+      accepted: true,
+    });
+    expect(
+      coordinator.accept(synchronize("sync-chip-authored", { author: "chipbyte-snap" })),
+    ).toMatchObject({ addressed: false, accepted: false });
+    expect(
+      coordinator.accept(synchronize("sync-closed", { state: "closed" })),
+    ).toMatchObject({ addressed: false, accepted: false });
+    expect(coordinator.accept(synchronize("sync-merged", { merged: true }))).toMatchObject({
+      addressed: false,
+      accepted: false,
+    });
+  });
+
   it("debounces unmentioned enrolled feedback on a Chip-authored pull request", () => {
     const db = openDatabase(":memory:");
     const people = new PeopleStore(db);
