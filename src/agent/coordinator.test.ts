@@ -668,6 +668,113 @@ describe("AgentCoordinator", () => {
     });
   });
 
+  it("skips a synchronize already covered by Chip and resumes an uncovered requested head", async () => {
+    const db = openDatabase(":memory:");
+    const people = new PeopleStore(db);
+    people.setRole("pr", PR_ROLE_POLICY);
+    const zack = people.add({ nickname: "Zack", roleName: "pr" });
+    people.attachIdentity({
+      personId: zack.id,
+      provider: "github",
+      tenantId: "github.com",
+      externalId: "17470",
+      handle: "zadams",
+    });
+    const work = new WorkItemStore(db);
+    const requests = new AgentRequestStore(db);
+    const coordinator = new AgentCoordinator(people, work, requests, undefined, {
+      sinkAdapterName: "hermes",
+    });
+    const item = work.getOrCreate({
+      kind: "github",
+      key: "github:101:pull-request:1124",
+      title: "GitHub PR snapnhd/system#1124",
+    });
+    work.attachAlias(item.id, {
+      provider: "correlation",
+      scope: "github",
+      nativeKey: "github:101:pull-request:1124",
+    });
+    work.setCodexThread(item.id, "wakewire-pr-1124");
+    work.setWorkspace(item.id, "/Users/chip/Snap");
+    const headSha = "1234567890abcdef1234567890abcdef12345678";
+    const synchronize = (deliveryId: string, requested: boolean): WakeEvent => ({
+      source: "github",
+      sourceId: "github-snapnhd-system",
+      kind: "pull_request.synchronize",
+      deliveryId,
+      occurredAt: "2026-09-02T14:00:00.000Z",
+      summary: "PR #1124 synchronized on snapnhd/system",
+      payload: {
+        repo: "snapnhd/system",
+        repositoryId: 101,
+        number: 1124,
+        isPullRequest: true,
+        author: "zadams",
+        requestedReviewerLogins: requested ? ["chipbyte-snap"] : [],
+        headSha,
+      },
+      principal: {
+        provider: "github",
+        tenantId: "github.com",
+        subjectId: "17470",
+        handle: "zadams",
+      },
+      conversation: {
+        nativeKey: "101:1124",
+        rootKey: "101:1124",
+        replyTarget: "101:1124",
+      },
+    });
+    let reviewEvidence: null | {
+      lastChipReviewSha: string;
+      lastChipReviewState: string;
+      lastChipReviewBody: string;
+    } = {
+      lastChipReviewSha: headSha,
+      lastChipReviewState: "APPROVED",
+      lastChipReviewBody: "",
+    };
+    const hermes = new FakeHermes();
+    const reviewCommitLookup = vi.fn(async () => reviewEvidence);
+    const worker = new AgentDispatchWorker(
+      people,
+      work,
+      requests,
+      { resolveIdentifier: async () => null, issuesForUrl: async () => [] },
+      hermes,
+      pino({ level: "silent" }),
+      {
+        reviewCommitLookup,
+        hermesSessionLookup: () => ({ hits: [], runningIds: new Set(), cmdlineBusy: false }),
+      },
+    );
+
+    const covered = coordinator.accept(synchronize("sync-covered", false));
+    await worker.tick();
+    expect(reviewCommitLookup).toHaveBeenCalledTimes(1);
+    expect(hermes.calls).toHaveLength(0);
+    expect(requests.get(covered.requestId ?? "")?.status).toBe("completed");
+
+    reviewEvidence = {
+      lastChipReviewSha: headSha,
+      lastChipReviewState: "COMMENTED",
+      lastChipReviewBody:
+        "Exact-head local verification did not produce a retrievable aggregate result.",
+    };
+    const processMiss = coordinator.accept(synchronize("sync-process-miss", true));
+    await worker.tick();
+    expect(hermes.calls).toEqual([
+      expect.objectContaining({ kind: "resume", threadId: "wakewire-pr-1124" }),
+    ]);
+
+    reviewEvidence = null;
+    const unrequested = coordinator.accept(synchronize("sync-no-review", false));
+    await worker.tick();
+    expect(hermes.calls).toHaveLength(1);
+    expect(requests.get(unrequested.requestId ?? "")?.status).toBe("completed");
+  });
+
   it("debounces unmentioned enrolled feedback on a Chip-authored pull request", () => {
     const db = openDatabase(":memory:");
     const people = new PeopleStore(db);

@@ -23,6 +23,7 @@ import {
   type ExecutionReasoningEffort,
   parseExecutionProfile,
 } from "./execution-profile.js";
+import { chipReviewCoversHead, type ChipReviewCommit } from "./github-review-head.js";
 import { buildHermesSessionOptions, hermesTargetFromEvent } from "./hermes-identity.js";
 import {
   decideHermesSessionReuse,
@@ -328,6 +329,11 @@ export interface AgentDispatchWorkerOptions {
     since: string,
     signal?: AbortSignal | undefined,
   ) => Promise<boolean>;
+  /** Returns Chip's latest submitted review for live-HEAD coverage decisions. */
+  reviewCommitLookup?: (
+    event: WakeEvent,
+    signal?: AbortSignal | undefined,
+  ) => Promise<ChipReviewCommit | null>;
 }
 
 /** Correlates, provisions, and submits accepted requests independently of acknowledgments. */
@@ -348,6 +354,9 @@ export class AgentDispatchWorker {
   >;
   private readonly reviewArtifactLookup: NonNullable<
     AgentDispatchWorkerOptions["reviewArtifactLookup"]
+  >;
+  private readonly reviewCommitLookup: NonNullable<
+    AgentDispatchWorkerOptions["reviewCommitLookup"]
   >;
   private readonly activeWorkItems = new Set<string>();
   private readonly activeRequests = new Map<string, Promise<void>>();
@@ -383,6 +392,7 @@ export class AgentDispatchWorker {
     this.reviewStatusLookup = options.reviewStatusLookup ?? (async () => null);
     this.reviewStatusEnsure = options.reviewStatusEnsure ?? (async () => null);
     this.reviewArtifactLookup = options.reviewArtifactLookup ?? (async () => false);
+    this.reviewCommitLookup = options.reviewCommitLookup ?? (async () => null);
   }
 
   start(): number {
@@ -779,6 +789,49 @@ export class AgentDispatchWorker {
       );
     }
     const reuse = this.hermesReuseDecision(request, item, linearIssue);
+    if (request.event.kind === "pull_request.synchronize") {
+      const headSha = stringPayload(request.event, "headSha").trim().toLowerCase();
+      if (!/^[0-9a-f]{40}$/u.test(headSha)) {
+        throw new Error("PR synchronize is missing one exact full HEAD SHA");
+      }
+      const review = await this.reviewCommitLookup(request.event, signal);
+      signal.throwIfAborted();
+      if (review && chipReviewCoversHead({ ...review, headSha })) {
+        this.requests.finalizeImmediateCompletion({
+          requestId: request.id,
+          codexThreadId: item.codexThreadId ?? `review-head-covered-${request.id}`,
+          status: "completed",
+        });
+        this.logger.info(
+          { request: request.id, workItem: item.id, headSha },
+          "ignored PR synchronize already covered by Chip",
+        );
+        return;
+      }
+      const requestedReviewerLogins = Array.isArray(
+        request.event.payload.requestedReviewerLogins,
+      )
+        ? request.event.payload.requestedReviewerLogins
+        : [];
+      const chipStillRequested = requestedReviewerLogins.some(
+        (login) =>
+          typeof login === "string" &&
+          login.trim().toLowerCase() === DEFAULT_CHIP_IDENTITIES.githubHandle,
+      );
+      const reviewInFlight = reuse?.action === "ignore" || reuse?.action === "hold";
+      if (!review && !chipStillRequested && !reviewInFlight) {
+        this.requests.finalizeImmediateCompletion({
+          requestId: request.id,
+          codexThreadId: item.codexThreadId ?? `review-head-unrequested-${request.id}`,
+          status: "completed",
+        });
+        this.logger.info(
+          { request: request.id, workItem: item.id, headSha },
+          "ignored unrequested PR synchronize without prior Chip review",
+        );
+        return;
+      }
+    }
     if (reuse?.action === "ignore") {
       await this.stageReviewAlreadyRunning(request, item, signal);
       return;
@@ -1732,9 +1785,14 @@ function isGithubPullRequestEvent(event: WakeEvent): boolean {
 }
 
 function hasGithubReviewSubmissionAuthority(event: WakeEvent): boolean {
+  const author =
+    event.kind === "pull_request.review_requested" || event.kind === "pull_request.synchronize"
+      ? stringPayload(event, "author")
+      : stringPayload(event, "pullRequestAuthorLogin");
   return (
     isGithubPullRequestEvent(event) &&
-    stringPayload(event, "pullRequestAuthorLogin").toLowerCase() !== "chipbyte-snap"
+    author.length > 0 &&
+    author.toLowerCase() !== DEFAULT_CHIP_IDENTITIES.githubHandle
   );
 }
 
@@ -1764,7 +1822,12 @@ function enforceGithubPrReviewEffort(
 
 function isGithubReviewStartRequest(event: WakeEvent): boolean {
   if (!isGithubPullRequestEvent(event)) return false;
-  if (event.kind === "pull_request.review_requested") return true;
+  if (
+    event.kind === "pull_request.review_requested" ||
+    event.kind === "pull_request.synchronize"
+  ) {
+    return true;
+  }
   const body = stringPayload(event, "body")
     .replace(/@chipbyte-snap\b|@chip\b/giu, " ")
     .replace(/\s+/gu, " ")

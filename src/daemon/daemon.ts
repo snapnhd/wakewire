@@ -12,6 +12,7 @@ import {
   createGithubReviewStatusEnsure,
   createGithubReviewStatusLookup,
 } from "../agent/github-review-status.js";
+import { createGithubReviewCommitLookup } from "../agent/github-review-head.js";
 import { defaultHermesSessionLookup } from "../agent/hermes-session-reuse.js";
 import {
   LinearGraphqlDirectory,
@@ -206,6 +207,7 @@ export class Daemon {
         reviewStatusLookup: createGithubReviewStatusLookup({ secrets }),
         reviewStatusEnsure: createGithubReviewStatusEnsure({ secrets }),
         reviewArtifactLookup: createGithubReviewArtifactLookup({ secrets }),
+        reviewCommitLookup: createGithubReviewCommitLookup({ secrets }),
       },
     );
     this.agentWorker = agentWorker;
