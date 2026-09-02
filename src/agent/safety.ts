@@ -361,7 +361,9 @@ function inSessionExactHeadReviewRules(): string[] {
     "- Role stamps filesystem/shell/git=read and secrets.use=false forbid push, history rewrite, deleting shared trees, mutating the default system checkout, and printing secrets. They do not forbid that isolated clone, fetching the PR and base refs into it, checking out a hostname-safe local branch at the exact head OID, or running make secrets/make test there.",
     "- Creating that clone is a permitted create, not a destructive git write. A missing commit in the shared default checkout is not a blocker. Do not stop to ask for clone permission.",
     "- git reset, force-pull, and checkout -B of an existing SHA-named clone are forbidden.",
-    "- Restoring a sibling lockfile not present in the GitHub diff is allowed, as scoped for Task 9.",
+    "- Only app/yarn.lock, yarn.lock, or app/package-lock.json may be restored, and only when the one dirty path is absent from the GitHub PR files list and git status --porcelain reports only that path (with its optional space/M/ M status prefix).",
+    "- Restore with git checkout -- <path> in the SHA-named clone only, then recheck that porcelain is empty and HEAD is unchanged.",
+    "- Fail closed for every other dirty path or a lockfile changed by the PR. Never use git reset --hard or git clean.",
     "- Clone-root make test may DROP/CREATE those harness-gated local *_test databases. Do not refuse make test as a database reset.",
   ];
 }
