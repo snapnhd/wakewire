@@ -7,12 +7,12 @@ import { ClaudeProxyStore } from "../agent/claude-proxy-store.js";
 import { CompletionWorker } from "../agent/completion-worker.js";
 import { AgentCoordinator, AgentDispatchWorker } from "../agent/coordinator.js";
 import { DispatcherControlCoordinator } from "../agent/dispatcher-control.js";
+import { createGithubReviewCommitLookup } from "../agent/github-review-head.js";
 import {
   createGithubReviewArtifactLookup,
   createGithubReviewStatusEnsure,
   createGithubReviewStatusLookup,
 } from "../agent/github-review-status.js";
-import { createGithubReviewCommitLookup } from "../agent/github-review-head.js";
 import { defaultHermesSessionLookup } from "../agent/hermes-session-reuse.js";
 import {
   LinearGraphqlDirectory,

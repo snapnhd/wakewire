@@ -335,24 +335,14 @@ describe("buildSafetyWrappedPrompt", () => {
     expect(prompt).toContain(
       "Only app/yarn.lock, yarn.lock, or app/package-lock.json may be restored",
     );
-    expect(prompt).toContain(
-      "the one dirty path is absent from the GitHub PR files list",
-    );
-    expect(prompt).toContain(
-      "git status --porcelain reports only that path",
-    );
-    expect(prompt).toContain(
-      "git checkout -- <path> in the SHA-named clone only",
-    );
-    expect(prompt).toContain(
-      "recheck that porcelain is empty and HEAD is unchanged",
-    );
+    expect(prompt).toContain("the one dirty path is absent from the GitHub PR files list");
+    expect(prompt).toContain("git status --porcelain reports only that path");
+    expect(prompt).toContain("git checkout -- <path> in the SHA-named clone only");
+    expect(prompt).toContain("recheck that porcelain is empty and HEAD is unchanged");
     expect(prompt).toContain(
       "Fail closed for every other dirty path or a lockfile changed by the PR",
     );
-    expect(prompt).toContain(
-      "Never use git reset --hard or git clean",
-    );
+    expect(prompt).toContain("Never use git reset --hard or git clean");
     expect(prompt).toContain(
       "Do not submit a GitHub review whose only content is an exact-head or harness miss",
     );

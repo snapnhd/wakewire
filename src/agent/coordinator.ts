@@ -233,8 +233,7 @@ export class AgentCoordinator {
       !maintainedPrFeedback &&
       !hasChipGithubMention(event, this.chip);
     const debounceFeedback = maintainedPrFeedback || unmentionedThreadReply;
-    const debounceHeadMove =
-      event.source === "github" && event.kind === "pull_request.synchronize";
+    const debounceHeadMove = event.source === "github" && event.kind === "pull_request.synchronize";
     const debounceRequest = debounceFeedback || debounceHeadMove;
     const acceptedAt = this.now();
     let ackSpec: ReturnType<typeof buildAckSpec>;
@@ -626,7 +625,10 @@ export class AgentDispatchWorker {
     return operation;
   }
 
-  private activeRequestForWorkItem(workItemId: string, excludeRequestId: string): AgentRequest | null {
+  private activeRequestForWorkItem(
+    workItemId: string,
+    excludeRequestId: string,
+  ): AgentRequest | null {
     for (const requestId of this.activeRequests.keys()) {
       if (requestId === excludeRequestId) continue;
       const request = this.requests.get(requestId);
@@ -935,9 +937,7 @@ export class AgentDispatchWorker {
         );
         return;
       }
-      const requestedReviewerLogins = Array.isArray(
-        request.event.payload.requestedReviewerLogins,
-      )
+      const requestedReviewerLogins = Array.isArray(request.event.payload.requestedReviewerLogins)
         ? request.event.payload.requestedReviewerLogins
         : [];
       const chipStillRequested = requestedReviewerLogins.some(
@@ -972,16 +972,9 @@ export class AgentDispatchWorker {
         throw new Error("system PR pickup status could not be verified in the pull request body");
       }
     } else if (request.event.kind === "pull_request.synchronize") {
-      const pickup = githubReviewHeadMovePickupUpdate(
-        request.event,
-        this.now().toISOString(),
-      );
+      const pickup = githubReviewHeadMovePickupUpdate(request.event, this.now().toISOString());
       if (!pickup) throw new Error("PR synchronize is missing one exact full HEAD SHA");
-      const status = await this.reviewStatusUpdate(
-        request.event,
-        pickup,
-        signal,
-      );
+      const status = await this.reviewStatusUpdate(request.event, pickup, signal);
       if (systemPrReview && !status) {
         throw new Error("system PR pickup status could not be verified in the pull request body");
       }
@@ -2229,10 +2222,7 @@ function enforceGithubPrReviewEffort(
 
 function isGithubReviewStartRequest(event: WakeEvent): boolean {
   if (!isGithubPullRequestEvent(event)) return false;
-  if (
-    event.kind === "pull_request.review_requested" ||
-    event.kind === "pull_request.synchronize"
-  ) {
+  if (event.kind === "pull_request.review_requested" || event.kind === "pull_request.synchronize") {
     return true;
   }
   const body = stringPayload(event, "body")

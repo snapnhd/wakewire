@@ -781,9 +781,10 @@ describe("AgentCoordinator", () => {
     expect(
       coordinator.accept(synchronize("sync-chip-authored", { author: "chipbyte-snap" })),
     ).toMatchObject({ addressed: false, accepted: false });
-    expect(
-      coordinator.accept(synchronize("sync-closed", { state: "closed" })),
-    ).toMatchObject({ addressed: false, accepted: false });
+    expect(coordinator.accept(synchronize("sync-closed", { state: "closed" }))).toMatchObject({
+      addressed: false,
+      accepted: false,
+    });
     expect(coordinator.accept(synchronize("sync-merged", { merged: true }))).toMatchObject({
       addressed: false,
       accepted: false,

@@ -359,9 +359,8 @@ function trimPullRequest(args: {
         ? payload.after
         : "";
   const beforeSha = typeof payload.before === "string" ? payload.before : "";
-  const requestedReviewerLogins = (Array.isArray(pr.requested_reviewers)
-    ? pr.requested_reviewers
-    : []
+  const requestedReviewerLogins = (
+    Array.isArray(pr.requested_reviewers) ? pr.requested_reviewers : []
   )
     .map((reviewer) => (isRecord(reviewer) ? stringOf(reviewer.login).trim().toLowerCase() : ""))
     .filter(Boolean);
