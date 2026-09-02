@@ -12,6 +12,7 @@ import {
   createGithubReviewArtifactLookup,
   createGithubReviewStatusEnsure,
   createGithubReviewStatusLookup,
+  createGithubReviewStatusUpdate,
 } from "../agent/github-review-status.js";
 import { defaultHermesSessionLookup } from "../agent/hermes-session-reuse.js";
 import {
@@ -29,6 +30,7 @@ import {
   ScheduledChannelDeliveryStore,
 } from "../agent/scheduled-channel-delivery.js";
 import { ScheduledFollowupService, ScheduledFollowupStore } from "../agent/scheduled-followup.js";
+import { createSystemPrSpecialistProofLookup } from "../agent/specialist-proof.js";
 import { AgentRequestStore, WorkItemStore } from "../agent/store.js";
 import { ThreadTitleWorker, upgradeLegacyTaskTitles } from "../agent/title-sync-worker.js";
 import { loadConfig, loadDispatcherDefaultAgent } from "../config.js";
@@ -206,8 +208,10 @@ export class Daemon {
         hermesSessionLookup: defaultHermesSessionLookup,
         reviewStatusLookup: createGithubReviewStatusLookup({ secrets }),
         reviewStatusEnsure: createGithubReviewStatusEnsure({ secrets }),
+        reviewStatusUpdate: createGithubReviewStatusUpdate({ secrets }),
         reviewArtifactLookup: createGithubReviewArtifactLookup({ secrets }),
         reviewCommitLookup: createGithubReviewCommitLookup({ secrets }),
+        specialistProofLookup: createSystemPrSpecialistProofLookup(),
       },
     );
     this.agentWorker = agentWorker;

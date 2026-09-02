@@ -77,7 +77,8 @@ describe("LinearAgentTokenProvider", () => {
 describe("linearViewer", () => {
   it("queries and returns the immutable app user id", async () => {
     const fetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-      expect((init?.headers as Record<string, string>).authorization).toBe("Bearer token");
+      if (!init) throw new Error("expected Linear request init");
+      expect((init.headers as Record<string, string>).authorization).toBe("Bearer token");
       return new Response(
         JSON.stringify({
           data: {
@@ -100,7 +101,8 @@ describe("linearViewer", () => {
 
   it("uses raw API-key authorization when requested", async () => {
     const fetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-      expect((init?.headers as Record<string, string>).authorization).toBe("api-key");
+      if (!init) throw new Error("expected Linear request init");
+      expect((init.headers as Record<string, string>).authorization).toBe("api-key");
       return Response.json({
         data: {
           viewer: { id: "chip-user", name: "Chip Byte", email: "chip@snapcorp.com" },

@@ -1,6 +1,7 @@
 import type { WakeEvent } from "../core/event.js";
 import { isAuthenticatedSlackHumanMessage } from "../sources/slack/normalize.js";
 import { linearThreadParentId } from "./linear-thread.js";
+import { isChipReviewThreadReply } from "./targeting.js";
 
 export interface SourceReplySpec {
   provider: string;
@@ -236,9 +237,16 @@ export function normalizeGithubFinalReplyText(value: string): string {
  * `pull_request.review_requested` is excluded: Chip posts the review via
  * `gh pr review` / GitHub API. Echoing finalResponse as an issue comment
  * duplicates that summary (incident: snapnhd/system#1108, also #1105).
+ *
+ * Unmentioned review-thread replies are also excluded: Chip replies in the
+ * original review conversation. A WakeWire issue comment would land on the
+ * wrong surface and would leak a "not for me" silence as a top-level post.
  */
 export function shouldSkipGithubIssueComment(event: WakeEvent): boolean {
-  return event.source === "github" && event.kind.startsWith("pull_request.review_requested");
+  return (
+    event.source === "github" &&
+    (event.kind.startsWith("pull_request.review_requested") || isChipReviewThreadReply(event))
+  );
 }
 
 export function buildGithubReviewProgressReplySpec(
@@ -254,7 +262,7 @@ export function buildGithubReviewProgressReplySpec(
 function githubFinalReply(event: WakeEvent, finalResponse: string): SourceReplySpec {
   if (shouldSkipGithubIssueComment(event)) {
     throw new UnsupportedSourceReplyEventError(
-      "GitHub review_requested: skip issue-comment; the agent posts the review",
+      "GitHub review continuation: skip issue-comment; the agent posts in the review thread",
     );
   }
   return githubIssueCommentReply(event, finalResponse);

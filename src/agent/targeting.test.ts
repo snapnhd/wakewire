@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { WakeEvent } from "../core/event.js";
-import { exactPingPongReply, isChipAddressed, isChipPrincipal, requestText } from "./targeting.js";
+import {
+  exactPingPongReply,
+  isChipAddressed,
+  isChipPrincipal,
+  isChipReviewThreadReply,
+  requestText,
+} from "./targeting.js";
 
 function event(overrides: Partial<WakeEvent>): WakeEvent {
   return {
@@ -260,6 +266,79 @@ describe("Chip targeting", () => {
         maintained("pull_request_review.submitted", {
           senderAuthoredFeedback: false,
           body: "",
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("classifies unmentioned GitHub review-thread replies without addressing them yet", () => {
+    const reply = event({
+      kind: "pull_request_review_comment.created",
+      payload: {
+        repo: "snapnhd/system",
+        repositoryId: 101,
+        number: 1140,
+        isPullRequest: true,
+        pullRequestAuthorLogin: "misaelsnap",
+        senderAuthoredFeedback: true,
+        senderType: "User",
+        inReplyToId: 3904845832,
+        body: "Taking you up on the rescope path.",
+      },
+    });
+    expect(isChipReviewThreadReply(reply)).toBe(true);
+    expect(isChipAddressed(reply)).toBe(false);
+    expect(requestText(reply)).toContain("without mentioning Chip");
+    expect(requestText(reply)).toContain("Taking you up on the rescope path.");
+    expect(requestText(reply)).toContain("Do not post a new top-level issue comment");
+
+    expect(
+      isChipReviewThreadReply(
+        event({
+          kind: "pull_request_review_comment.created",
+          payload: { ...reply.payload, inReplyToId: undefined },
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isChipAddressed(
+        event({
+          ...reply,
+          targetMentions: [{ kind: "handle", value: "chipbyte-snap" }],
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("auto-targets an empty APPROVED review on a Chip-authored pull request", () => {
+    const emptyApproval = event({
+      kind: "pull_request_review.submitted",
+      payload: {
+        repo: "snapnhd/system",
+        repositoryId: 101,
+        number: 1158,
+        isPullRequest: true,
+        pullRequestAuthorLogin: "chipbyte-snap",
+        senderType: "User",
+        body: "",
+        reviewState: "approved",
+      },
+    });
+
+    expect(isChipAddressed(emptyApproval)).toBe(true);
+    expect(requestText(emptyApproval)).toContain(
+      "approved Chip-authored PR snapnhd/system#1158 with no review text",
+    );
+    expect(requestText(emptyApproval)).toContain("never merge the PR automatically");
+    expect(requestText(emptyApproval)).toContain("🏁 done");
+    expect(requestText(emptyApproval)).not.toContain(
+      "fetch every unresolved review thread and top-level comment",
+    );
+    expect(
+      isChipAddressed(
+        event({
+          kind: "pull_request_review.submitted",
+          payload: { ...emptyApproval.payload, reviewState: "commented" },
         }),
       ),
     ).toBe(false);

@@ -45,18 +45,21 @@ describe("trimGithubEvent — push", () => {
 
   it("truncates commit messages at 500 chars and counts changed files", () => {
     const event = trimGithubEvent({ eventName: "push", deliveryId: "d-1", payload });
-    const commits = event?.payload.commits as Array<Record<string, unknown>>;
+    if (!event) throw new Error("expected push event");
+    const commits = event.payload.commits as Array<Record<string, unknown>>;
     expect(commits[0]).toEqual({
       sha: "abc123",
       author: "glenn",
       message: "fix: a bug",
       filesChanged: 3,
     });
-    expect((commits[1]?.message as string).length).toBeLessThanOrEqual(
-      500 + "… [truncated]".length,
-    );
-    expect(commits[1]?.message as string).toContain("[truncated]");
-    expect(commits[1]?.filesChanged).toBe(1);
+    const secondCommit = commits[1];
+    if (!secondCommit || typeof secondCommit.message !== "string") {
+      throw new Error("expected second commit with a message");
+    }
+    expect(secondCommit.message.length).toBeLessThanOrEqual(500 + "… [truncated]".length);
+    expect(secondCommit.message).toContain("[truncated]");
+    expect(secondCommit.filesChanged).toBe(1);
   });
 
   it("caps commits at 20 and records the truncation", () => {
@@ -69,10 +72,11 @@ describe("trimGithubEvent — push", () => {
       })),
     };
     const event = trimGithubEvent({ eventName: "push", deliveryId: "d-2", payload: many });
-    expect((event?.payload.commits as unknown[]).length).toBe(20);
-    expect(event?.payload.commitCount).toBe(30);
-    expect(event?.payload.commitsTruncatedTo).toBe(20);
-    expect(event?.summary).toBe("30 commits pushed to acme/api:main by glenn");
+    if (!event) throw new Error("expected push event");
+    expect((event.payload.commits as unknown[]).length).toBe(20);
+    expect(event.payload.commitCount).toBe(30);
+    expect(event.payload.commitsTruncatedTo).toBe(20);
+    expect(event.summary).toBe("30 commits pushed to acme/api:main by glenn");
   });
 });
 
@@ -331,6 +335,37 @@ describe("trimGithubEvent — pull_request / issues / fallback", () => {
       pullRequestAuthorLogin: "chipbyte-snap",
       senderAuthoredFeedback: true,
     });
+    expect(reviewComment?.payload.inReplyToId).toBeUndefined();
+
+    const threadReply = trimGithubEvent({
+      eventName: "pull_request_review_comment",
+      deliveryId: "d-thread-reply",
+      sourceId: "github-snap",
+      payload: {
+        action: "created",
+        repository: { id: 101, full_name: "snapnhd/system" },
+        sender: { id: 17471, login: "misaelsnap", type: "User" },
+        pull_request: {
+          number: 1140,
+          title: "Human PR",
+          user: { id: 2, login: "misaelsnap" },
+          head: { ref: "fra-2856" },
+        },
+        comment: {
+          id: 3907066898,
+          in_reply_to_id: 3904845832,
+          user: { id: 17471, login: "misaelsnap", type: "User" },
+          body: "Taking you up on the rescope path.",
+        },
+      },
+    });
+    expect(threadReply?.payload).toMatchObject({
+      isPullRequest: true,
+      pullRequestAuthorLogin: "misaelsnap",
+      senderAuthoredFeedback: true,
+      inReplyToId: 3904845832,
+      commentId: 3907066898,
+    });
 
     const review = trimGithubEvent({
       eventName: "pull_request_review",
@@ -390,6 +425,46 @@ describe("trimGithubEvent — pull_request / issues / fallback", () => {
     expect(bot?.payload).toMatchObject({ senderType: "Bot" });
     expect(bot?.payload.senderAuthoredFeedback).toBeUndefined();
     expect(bot?.targetMentions).toBeUndefined();
+  });
+
+  it("keeps reviewState on an empty APPROVED Chip-authored review without marking authored text", () => {
+    const review = trimGithubEvent({
+      eventName: "pull_request_review",
+      deliveryId: "d-empty-approval",
+      sourceId: "github-snap",
+      payload: {
+        action: "submitted",
+        repository: { id: 101, full_name: "snapnhd/system" },
+        sender: { id: 1819, login: "cj", type: "User" },
+        pull_request: {
+          number: 1158,
+          title: "Chip PR",
+          html_url: "https://github.com/snapnhd/system/pull/1158",
+          user: { id: 1, login: "chipbyte-snap" },
+          head: { ref: "eng-4717" },
+        },
+        review: {
+          id: 5078531708,
+          user: { id: 1819, login: "cj", type: "User" },
+          body: "",
+          state: "approved",
+          html_url: "https://github.com/snapnhd/system/pull/1158#pullrequestreview-5078531708",
+        },
+      },
+    });
+    expect(review).toMatchObject({
+      kind: "pull_request_review.submitted",
+      payload: {
+        number: 1158,
+        body: "",
+        reviewId: 5078531708,
+        reviewState: "approved",
+        isPullRequest: true,
+        pullRequestAuthorLogin: "chipbyte-snap",
+        senderType: "User",
+      },
+    });
+    expect(review?.payload.senderAuthoredFeedback).toBeUndefined();
   });
 
   it("extracts a newly-authored standalone @chip shorthand only", () => {
@@ -473,14 +548,15 @@ describe("trimGithubEvent — pull_request / issues / fallback", () => {
       deliveryId: "d-6",
       payload: { repository: { full_name: "acme/api" }, commits: [{}, "garbage"] },
     });
-    expect(push?.payload).toMatchObject({
+    if (!push) throw new Error("expected push event");
+    expect(push.payload).toMatchObject({
       repo: "acme/api",
       branch: "",
       pusher: "unknown",
       commitCount: 2,
     });
-    expect((push?.payload.commits as unknown[])[1]).toEqual({});
-    expect((push?.payload.commits as Array<Record<string, unknown>>)[0]).toEqual({
+    expect((push.payload.commits as unknown[])[1]).toEqual({});
+    expect((push.payload.commits as Array<Record<string, unknown>>)[0]).toEqual({
       sha: "",
       author: "unknown",
       message: "",

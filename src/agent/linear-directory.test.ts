@@ -60,7 +60,8 @@ describe("LinearGraphqlDirectory", () => {
     const invalidateToken = vi.fn();
     const authorizations: string[] = [];
     const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
-      authorizations.push((init?.headers as Record<string, string>).authorization ?? "");
+      if (!init) throw new Error("expected Linear request init");
+      authorizations.push((init.headers as Record<string, string>).authorization ?? "");
       if (authorizations.length === 1) return new Response("unauthorized", { status: 401 });
       return Response.json({
         data: {

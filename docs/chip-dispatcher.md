@@ -22,7 +22,7 @@ The default identity configuration is deliberately explicit:
 | Provider | Address Chip as | Acknowledgment after ten seconds |
 | --- | --- | --- |
 | Slack | mention the existing normal `@chip` / `@Chip Byte` account (including in a group PM), or send a one-to-one PM | `:eyes:` reaction from Chip |
-| GitHub | `@chipbyte-snap` or shorthand `@chip` in newly authored issue/PR/comment text; request a review from `chipbyte-snap`; or, on a PR authored by `chipbyte-snap`, leave a top-level comment, inline review comment, or non-empty review body | eyes reaction on the first exact issue/comment/review comment or PR; maintained-PR feedback is durably debounced for 30 seconds and processed as one full ledger |
+| GitHub | `@chipbyte-snap` or shorthand `@chip` in newly authored issue/PR/comment text; request a review from `chipbyte-snap`; on a PR authored by `chipbyte-snap`, leave a top-level comment, inline review comment, or non-empty review body; or, on a PR Chip already joined, reply in an existing review thread without a mention | eyes reaction on the first exact issue/comment/review comment or PR; maintained-PR feedback and unmentioned review-thread replies are durably debounced for 30 seconds and processed as one full ledger |
 | Gmail | send or copy `chip@snapcorp.com` and include exact `@chip` / `@Chip Byte` in the current unquoted body | no progress acknowledgment; final answer replies in the same Gmail thread |
 | Linear | type `@chip` and select `@Chip Byte`, or delegate the issue to the Chip agent | ephemeral `👀 I'm on it, <nickname>.` agent activity |
 
@@ -673,28 +673,73 @@ dispatcher never guesses which history to abandon.
 
 ## Snap workspace boundary
 
-A work item with one resolved Linear issue runs in that issue's exact
-`branchName`. This includes native Linear requests, GitHub requests whose PR
-branch/reference/attachment resolves to Linear, and Slack or email requests
-that explicitly reference a Linear issue.
+A work item with one resolved Linear issue uses the normalized lowercase ticket
+as its managed folder identity. For an authenticated `snapnhd/system` review,
+WakeWire prefers that authoritative ticket and falls back only to the exact PR
+URL when Linear identity is unavailable. It never derives identity from an
+arbitrary title, branch name, or comment.
 
-WakeWire never reproduces workspace provisioning. It accepts at most 63
-characters matching `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`, without trimming or
-slugifying, then invokes only:
+WakeWire delegates provisioning and lifecycle authority to the `workspaces`
+dispatcher, launched without a shell:
 
 ```bash
-make -C /Users/chip/Snap prepare <exact-linear-branch>
+make -C "$SNAP_ROOT/workspaces" dev fra-2967
+make -C "$SNAP_ROOT/workspaces" status fra-2967
 ```
 
-The process is launched without a shell. After Make succeeds, WakeWire verifies
-the real directory `/Users/chip/Snap/<exact-linear-branch>` and the matching
-`BRANCH_NAME` in `.snap/workspace.env`. Missing, redirected, duplicate, or
-conflicting metadata fails closed. The root Makefile remains the sole authority
-for Git, staging ancestry, Neon, Windmill, Caddy, ports, Redis, locks, secrets,
-and service lifecycle.
+The first `dev` argument may instead be the exact
+`https://github.com/snapnhd/system/pull/N` URL. After `dev`, WakeWire parses the
+resolved ticket and status, then verifies one real `workspaces/<ticket>` path,
+managed metadata, `overmind=running`, exact Git HEAD, and the exact App, Data,
+and Snapcorp hosts. Missing, redirected, duplicate, stopped, or conflicting
+state fails closed. No ad hoc scratch clone is created under `workspaces/`.
 
-Requests with no Linear identity run from `/Users/chip/Snap`; WakeWire does not
-invent a branch from prose or a GitHub/Slack/email subject.
+Non-system requests with no Linear identity continue from the Snap root. A
+persisted old branch-named cwd is never silently trusted; it must rebind through
+the ticket dispatcher or fail closed.
+
+## System PR review preflight and provider authority
+
+The first GitHub write is the pickup state in the PR description. WakeWire owns
+only two unique paired blocks: workspace links first, review status second.
+Every update fetches the latest full body, replaces only marker-owned ranges,
+PATCHes the merged body, and immediately reads it back. Duplicate, missing,
+overlapping, or malformed boundaries fail closed. Human content outside the
+blocks is preserved.
+
+GitHub exposes only a whole-body PATCH, so a concurrent author edit can still
+race between fetch and write. The mitigation is latest-body fetch per update,
+pure block replacement, immediate exact verification, and no retry from a stale
+body. Legacy Chip status comments are deleted only after successful body
+read-back proves the migration; each DELETE is then verified by fetching the
+exact comment and requiring it to be absent. Ordinary Chip and human comments
+are retained.
+
+Once the workspace is verified, WakeWire invokes exactly:
+
+```bash
+make -C "$SNAP_ROOT/workspaces" test fra-2967
+```
+
+The subprocess uses bounded diagnostics and process-tree cancellation. WakeWire
+requires explicit App, Data, Snapcorp, Windmill, and aggregate summaries, a zero
+exit, and the same exact HEAD before and after the run. Any drift, red suite, or
+malformed footer blocks the full review. A failure dispatches only one limited
+COMMENTED triage turn; a focused rerun cannot unlock the normal review.
+
+After a full-review turn, WakeWire accepts completion only when GitHub exposes a
+formal Chip review submitted after the request and the final response includes
+one exact specialist proof. The proof must match a private coordinator state
+event and a separate mode-0600 invocation attestation bound to the stable PR
+key, exact HEAD, per-attempt invocation ID, digest, and trusted verdict. PR-body progress alone cannot
+satisfy either gate. Missing or `INCOMPLETE` evidence updates the body to a
+non-terminal hold and retries the same request/session; a recovery turn that
+already has a formal review is explicitly forbidden from posting another one.
+
+One canonical parent PR session owns every provider write. Read-only children
+may inspect independent slices after the relevant gate, but cannot post, edit
+the PR body, resolve threads, approve, merge, or start another PR session. The
+parent rechecks child evidence at the exact HEAD and posts once.
 
 ## Progress acknowledgments and final source responses
 
@@ -721,7 +766,7 @@ their final answer remains in Desktop until provider-specific final responders
 are added. The stored provider target controls routing; model output cannot
 retarget, broadcast, or create mentions.
 
-If the root Makefile exits unsuccessfully or the resulting Snap workspace fails
+If the workspace dispatcher exits unsuccessfully or the resulting Snap workspace fails
 identity validation before submission, WakeWire does not keep retrying an
 untyped controller failure forever. It marks the authenticated request failed
 and, for Slack or Gmail, atomically queues a fixed host-generated notice to the

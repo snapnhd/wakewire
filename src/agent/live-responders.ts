@@ -182,7 +182,8 @@ export class LinearGraphqlActivityTransport {
     parentId?: string | undefined;
     signal?: AbortSignal | undefined;
   }): Promise<{ commentId?: string | undefined }> {
-    if (!this.linearEnvironment) {
+    const linearEnvironment = this.linearEnvironment;
+    if (!linearEnvironment) {
       throw new PermanentAckError("dedicated Linear API key is not configured");
     }
     const post = async (parentId?: string) => {
@@ -190,7 +191,7 @@ export class LinearGraphqlActivityTransport {
         method: "POST",
         signal: providerSignal(input.signal),
         headers: {
-          authorization: this.linearEnvironment!.apiKey,
+          authorization: linearEnvironment.apiKey,
           "content-type": "application/json",
         },
         body: JSON.stringify({

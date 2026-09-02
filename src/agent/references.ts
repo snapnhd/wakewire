@@ -141,6 +141,8 @@ export function uniqueLinearIdentifiers(references: readonly LinearReference[]):
 /**
  * GitHub PR ↔ Linear is 1:1. The PR title/branch is the ticket; extra ENG/FRA
  * ids in comments (or Linear linkback “also references”) are not more work items.
+ * Linear-origin events similarly keep the native issue; title/body citations
+ * of other tickets are references, not extra work items.
  */
 export function primaryLinearIdentifierForGithubPr(input: {
   title?: string | undefined;

@@ -42,9 +42,7 @@ const MAX_TITLE = 100;
  * Prefer Snapcorp addresses, else first enrolled email (lowercased).
  */
 export function pickLinearEmail(emails: readonly string[]): string | null {
-  const normalized = [
-    ...new Set(emails.map((e) => e.trim().toLowerCase()).filter(Boolean)),
-  ];
+  const normalized = [...new Set(emails.map((e) => e.trim().toLowerCase()).filter(Boolean))];
   if (normalized.length === 0) return null;
   const snap = normalized.find((e) => e.endsWith("@snapcorp.com"));
   return snap ?? normalized[0] ?? null;
@@ -86,8 +84,7 @@ export function hermesIdentityFromPrincipal(input: {
   if (provider === "linear") {
     const fromPrincipal = principal?.email?.trim().toLowerCase();
     const email =
-      (fromPrincipal && fromPrincipal.includes("@") ? fromPrincipal : null) ||
-      pickLinearEmail(input.person.emails);
+      (fromPrincipal?.includes("@") ? fromPrincipal : null) || pickLinearEmail(input.person.emails);
     if (!email) {
       throw new PermanentError(
         "missing linear email for Hermes session stamp (enroll a person email alias)",
@@ -168,10 +165,7 @@ export function buildHermesSessionKey(target: HermesTargetRef): string {
  * GitHub: snapnhd/system#997 or snapnhd/system#997 · short
  * Linear: FRA-2818 · short
  */
-export function buildHermesDesktopTitle(
-  target: HermesTargetRef,
-  fallbackTitle?: string,
-): string {
+export function buildHermesDesktopTitle(target: HermesTargetRef, fallbackTitle?: string): string {
   if (target.platform === "github") {
     const item =
       target.repo && target.number
@@ -208,8 +202,7 @@ export function buildHermesSessionOptions(input: {
   });
   // Prefer stable target keys over opaque workitem:uuid when we have repo#n / FRA-id.
   const sessionKey = buildHermesSessionKey(target);
-  const chatId =
-    sessionKey.endsWith(":unknown") && stamp.chatId ? stamp.chatId : sessionKey;
+  const chatId = sessionKey.endsWith(":unknown") && stamp.chatId ? stamp.chatId : sessionKey;
   const sessionTitle = buildHermesDesktopTitle(target, input.workItemTitle);
   const displayName = stamp.userName || stamp.userId;
   return {
@@ -270,5 +263,10 @@ function clipDetail(value: string): string {
 function clipTitle(value: string): string {
   const n = normalizePart(value) || "Chip";
   const pts = [...n];
-  return pts.length > MAX_TITLE ? `${pts.slice(0, MAX_TITLE - 1).join("").trimEnd()}…` : n;
+  return pts.length > MAX_TITLE
+    ? `${pts
+        .slice(0, MAX_TITLE - 1)
+        .join("")
+        .trimEnd()}…`
+    : n;
 }

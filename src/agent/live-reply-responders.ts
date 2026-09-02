@@ -3,24 +3,22 @@ import { OAuth2Client } from "google-auth-library";
 import type { SourceStore } from "../db/repos.js";
 import type { SecretStore } from "../secrets/store.js";
 import { secretNames } from "../secrets/store.js";
-import type { LinearEnvironmentIdentity } from "../sources/linear/environment.js";
 import { GmailSourceConfigSchema } from "../sources/gmail/source.js";
+import type { LinearEnvironmentIdentity } from "../sources/linear/environment.js";
 import { SlackSourceConfigSchema } from "../sources/slack/source.js";
+import { LinearGraphqlActivityTransport } from "./live-responders.js";
 import type { SourceReplyResponder, SourceReplySendResult } from "./reply-responders.js";
 import {
   PermanentSourceReplyError,
   RetryableSourceReplyError,
   SourceReplyResponderRegistry,
 } from "./reply-responders.js";
+import { type GithubFinalFetch, GithubFinalReplyResponder } from "./responders/github-reply.js";
 import {
   type GmailFinalReplyInput,
   GmailFinalReplyResponder,
   type GmailFinalReplyTransport,
 } from "./responders/gmail-reply.js";
-import {
-  GithubFinalReplyResponder,
-  type GithubFinalFetch,
-} from "./responders/github-reply.js";
 import { LinearFinalReplyResponder } from "./responders/linear-reply.js";
 import {
   type SlackConversationHistoryArguments,
@@ -29,7 +27,6 @@ import {
   type SlackPostMessageArguments,
 } from "./responders/slack-reply.js";
 import type { SourceReplyJob } from "./store.js";
-import { LinearGraphqlActivityTransport } from "./live-responders.js";
 
 const PROVIDER_REQUEST_TIMEOUT_MS = 5_000;
 
@@ -90,9 +87,7 @@ export class SourceScopedGithubFinalResponder implements SourceReplyResponder {
   async send(job: SourceReplyJob, signal?: AbortSignal): Promise<SourceReplySendResult> {
     const token = this.secrets.get(secretNames.githubApiToken(job.sourceId));
     if (!token) {
-      throw new PermanentSourceReplyError(
-        `GitHub API token is not configured for ${job.sourceId}`,
-      );
+      throw new PermanentSourceReplyError(`GitHub API token is not configured for ${job.sourceId}`);
     }
     const fetchAuth: GithubFinalFetch = async (url, init) => {
       const response = await this.fetchImpl(url, {

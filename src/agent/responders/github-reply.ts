@@ -47,7 +47,8 @@ export class GithubFinalReplyResponder implements SourceReplyResponder {
     }
     const repo = stringPayload(job, "repo");
     const number = stringPayload(job, "number");
-    if (!repo || !/^[^/]+\/[^/]+$/.test(repo) || !/^\d+$/.test(number)) {
+    const repoParts = repo.split("/");
+    if (repoParts.length !== 2 || !repoParts[0] || !repoParts[1] || !/^\d+$/.test(number)) {
       throw new PermanentSourceReplyError("GitHub final reply requires repo owner/name and number");
     }
     let text: string;
@@ -59,8 +60,7 @@ export class GithubFinalReplyResponder implements SourceReplyResponder {
       );
     }
     const body = `${text}\n\n<!-- wakewire-reply:${job.id} -->`;
-    const [owner, name] = repo.split("/");
-    const endpoint = `/repos/${encodeURIComponent(owner!)}/${encodeURIComponent(name!)}/issues/${encodeURIComponent(number)}/comments`;
+    const endpoint = `/repos/${encodeURIComponent(repoParts[0])}/${encodeURIComponent(repoParts[1])}/issues/${encodeURIComponent(number)}/comments`;
     const response = await this.fetch(`${this.apiBaseUrl}${endpoint}`, {
       method: "POST",
       headers: {

@@ -10,7 +10,8 @@ describe("Linear environment credential", () => {
 
   it("validates and returns the immutable viewer and organization", async () => {
     const fetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-      expect((init?.headers as Record<string, string>).authorization).toBe("chip-key");
+      if (!init) throw new Error("expected Linear request init");
+      expect((init.headers as Record<string, string>).authorization).toBe("chip-key");
       return Response.json({
         data: {
           viewer: { id: "chip-user", name: "Chip Byte", email: "chip@snapcorp.com" },

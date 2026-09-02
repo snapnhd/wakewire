@@ -220,6 +220,31 @@ describe("buildFinalReplySpec", () => {
     );
   });
 
+  it("does not echo an unmentioned review-thread reply as a top-level issue comment", () => {
+    const event: WakeEvent = {
+      source: "github",
+      sourceId: "github-snapnhd-system",
+      kind: "pull_request_review_comment.created",
+      deliveryId: "d-thread",
+      occurredAt: "2026-09-01T18:22:00.000Z",
+      summary: "Review comment on snapnhd/system#1140",
+      payload: {
+        repo: "snapnhd/system",
+        repositoryId: 101,
+        number: 1140,
+        isPullRequest: true,
+        senderType: "User",
+        senderAuthoredFeedback: true,
+        commentId: 3907066898,
+        inReplyToId: 3904845832,
+        body: "Taking you up on the rescope path.",
+      },
+    };
+    expect(() => buildFinalReplySpec(event, "Agreed — leaving this open for Zack.")).toThrow(
+      UnsupportedSourceReplyEventError,
+    );
+  });
+
   it("posts a Linear issue comment on the originating issue", () => {
     const event: WakeEvent = {
       source: "webhook",
@@ -396,29 +421,27 @@ describe("buildClaudeProxyReplySpec", () => {
     });
   });
 
-  it.each([
-    "im",
-    "channel",
-    "group",
-    "mpim",
-  ] as const)("returns a reply to the exact authenticated %s thread root", (channelType) => {
-    const channel = channelType === "im" ? "D0B7NH419CY" : "G0B7NH419CY";
-    expect(
-      buildClaudeProxyReplySpec(
-        claudeSlackEvent({ channelType, threadTs: "1785250218.127339" }),
-        "Done",
-      ),
-    ).toEqual({
-      provider: "slack",
-      kind: "thread-reply",
-      destination: `T2FCQUJ5P:${channel}:1785250218.127339`,
-      payload: {
-        channel,
-        threadTs: "1785250218.127339",
-        text: "Done",
-      },
-    });
-  });
+  it.each(["im", "channel", "group", "mpim"] as const)(
+    "returns a reply to the exact authenticated %s thread root",
+    (channelType) => {
+      const channel = channelType === "im" ? "D0B7NH419CY" : "G0B7NH419CY";
+      expect(
+        buildClaudeProxyReplySpec(
+          claudeSlackEvent({ channelType, threadTs: "1785250218.127339" }),
+          "Done",
+        ),
+      ).toEqual({
+        provider: "slack",
+        kind: "thread-reply",
+        destination: `T2FCQUJ5P:${channel}:1785250218.127339`,
+        payload: {
+          channel,
+          threadTs: "1785250218.127339",
+          text: "Done",
+        },
+      });
+    },
+  );
 
   it("uses the originating channel message as the root when a thread is first opened", () => {
     const spec = buildClaudeProxyReplySpec(claudeSlackEvent({ channelType: "channel" }), "Done");

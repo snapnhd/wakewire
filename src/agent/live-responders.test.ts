@@ -14,7 +14,7 @@ function env() {
 
 describe("LinearGraphqlActivityTransport.createReaction", () => {
   it("posts reactionCreate against the @chip comment", async () => {
-    const fetchImpl = vi.fn(async () => ({
+    const fetchImpl = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => ({
       ok: true,
       status: 200,
       json: async () => ({
@@ -35,8 +35,9 @@ describe("LinearGraphqlActivityTransport.createReaction", () => {
       }),
     ).resolves.toEqual({ reactionId: "rxn-1" });
 
-    const [, init] = fetchImpl.mock.calls[0] ?? [];
-    expect(JSON.parse(String((init as { body?: string })?.body))).toMatchObject({
+    const init = fetchImpl.mock.calls[0]?.[1];
+    if (!init) throw new Error("expected Linear request init");
+    expect(JSON.parse(String(init.body))).toMatchObject({
       variables: { input: { commentId: "comment-1", emoji: "👀" } },
     });
   });

@@ -454,34 +454,34 @@ describe("CompletionWorker", () => {
     });
   });
 
-  it.each([
-    "github",
-    "linear",
-  ] as const)("suppresses a fast %s reaction when the exact Desktop turn completes", async (provider) => {
-    const context = reactionOnlyFixture(provider);
-    const reader = new FixedReader(
-      result({
-        status: "completed",
-        threadId: `thread-${provider}`,
-        finalMessage: "Done",
-      }),
-    );
-    const worker = new CompletionWorker(context.store, reader, context.logger);
+  it.each(["github", "linear"] as const)(
+    "suppresses a fast %s reaction when the exact Desktop turn completes",
+    async (provider) => {
+      const context = reactionOnlyFixture(provider);
+      const reader = new FixedReader(
+        result({
+          status: "completed",
+          threadId: `thread-${provider}`,
+          finalMessage: "Done",
+        }),
+      );
+      const worker = new CompletionWorker(context.store, reader, context.logger);
 
-    await worker.tick();
+      await worker.tick();
 
-    // GitHub and Linear can post final comments; request stays submitted until
-    // the source-reply worker confirms delivery. Progress eyes are suppressed
-    // as soon as the final reply is queued.
-    expect(context.store.get(context.requestId)?.status).toBe("submitted");
-    expect(context.store.sourceReplyForRequest(context.requestId)).toMatchObject({
-      provider,
-      replyKind: "issue-comment",
-      status: "pending",
-    });
-    expect(context.store.ackForRequest(context.requestId)).toMatchObject({
-      status: "failed",
-      error: PROGRESS_ACK_SUPPRESSED_REASON,
-    });
-  });
+      // GitHub and Linear can post final comments; request stays submitted until
+      // the source-reply worker confirms delivery. Progress eyes are suppressed
+      // as soon as the final reply is queued.
+      expect(context.store.get(context.requestId)?.status).toBe("submitted");
+      expect(context.store.sourceReplyForRequest(context.requestId)).toMatchObject({
+        provider,
+        replyKind: "issue-comment",
+        status: "pending",
+      });
+      expect(context.store.ackForRequest(context.requestId)).toMatchObject({
+        status: "failed",
+        error: PROGRESS_ACK_SUPPRESSED_REASON,
+      });
+    },
+  );
 });

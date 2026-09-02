@@ -98,6 +98,7 @@ function trimReviewComment(args: {
   const number = numberOf(payload.number) ?? numberOf(pr.number);
   const title = truncate(stringOf(pr.title), 200);
   const author = isRecord(pr.user) ? stringOf(pr.user.login) : "";
+  const inReplyToId = numberOf(comment.in_reply_to_id);
   return {
     source: "github",
     kind,
@@ -111,6 +112,7 @@ function trimReviewComment(args: {
       title,
       body: truncate(stringOf(comment.body), 4_000),
       commentId: numberOf(comment.id) ?? null,
+      ...(inReplyToId !== undefined && inReplyToId > 0 ? { inReplyToId } : {}),
       url: stringOf(comment.html_url),
       pullRequestUrl: stringOf(pr.html_url),
       branch: isRecord(pr.head) && typeof pr.head.ref === "string" ? pr.head.ref : "",
@@ -134,6 +136,7 @@ function trimPullRequestReview(args: {
   const number = numberOf(payload.number) ?? numberOf(pr.number);
   const title = truncate(stringOf(pr.title), 200);
   const author = isRecord(pr.user) ? stringOf(pr.user.login) : "";
+  const reviewState = stringOf(review.state).trim();
   return {
     source: "github",
     kind,
@@ -147,6 +150,7 @@ function trimPullRequestReview(args: {
       title,
       body: truncate(stringOf(review.body), 4_000),
       reviewId: numberOf(review.id) ?? null,
+      ...(reviewState ? { reviewState } : {}),
       url: stringOf(review.html_url),
       pullRequestUrl: stringOf(pr.html_url),
       branch: isRecord(pr.head) && typeof pr.head.ref === "string" ? pr.head.ref : "",

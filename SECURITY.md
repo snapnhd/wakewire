@@ -270,11 +270,13 @@ and absence of a thread timestamp. Scheduled prompts must never call
 `slack_send_message` directly: that bypasses the frozen destination and exactly
 once boundary and may add connector-controlled product attribution.
 
-When a request resolves to Linear, WakeWire passes the exact lowercase
-`branchName` only to `make -C /Users/chip/Snap dev <branch>` without a shell. It
-then verifies the exact workspace path and matching private metadata. It never
-reimplements Git, Neon, Windmill, Caddy, Redis, port, lock, or secret
-provisioning. Missing, conflicting, or ambiguous identity fails closed.
+When a request resolves to Linear, WakeWire validates and normalizes the
+authoritative ticket, then passes it only to the Snap `workspaces` dispatcher
+without a shell. A system PR without Linear identity may use only its exact
+authenticated PR URL. WakeWire verifies the resulting ticket realpath, private
+metadata, running state, exact HEAD, and expected hosts. It never reimplements
+Git, Neon, Windmill, Caddy, Redis, port, lock, or secret provisioning. Missing,
+conflicting, stopped, redirected, or ambiguous identity fails closed.
 
 The Desktop adapter uses a private same-user Unix socket and a protocol that
 OpenAI does not document publicly. WakeWire verifies the OpenAI code signature,
@@ -304,6 +306,48 @@ correlate tasks and prevent replay after a crash; neither writes them. Run
 `wakewire desktop doctor` after helper changes or when compatibility health is
 degraded. Unsupported-version override remains a manual escape hatch and also
 widens interrupt support, so do not enable it without compatibility testing.
+
+### System PR body writes and exact-head review gate
+
+For `snapnhd/system`, WakeWire's first provider write is a pickup status in the
+PR body. It owns only the exact workspace-links and review-status marker pairs.
+Parsing fails closed on missing pairs, duplicates, overlaps, or malformed order;
+human text outside owned ranges is retained.
+
+GitHub updates pull-request bodies as whole documents. Residual risk remains
+that an author edits the body after WakeWire's latest fetch but before its
+PATCH. WakeWire mitigates this with a fresh GET for every transition, pure
+marker-only rendering, one PATCH, and an immediate GET/read-back that verifies
+the expected blocks and preserved remainder. It never retries from a cached
+body. Legacy Chip status comments are deleted only after that verification,
+and each deletion is read back from the exact comment endpoint as absent. All
+ordinary Chip comments and human comments remain.
+
+Verified links require dispatcher `dev` plus managed running status. The full
+review requires explicit App, Data, Snapcorp, Windmill, and aggregate pass
+summaries at one exact HEAD. Child-process output is bounded, the process tree
+is cancellable, and HEAD is read before and after. Drift, timeout, malformed
+output, or any failed suite blocks full-review authority.
+
+Full-review completion then requires two independent artifacts created after
+the authenticated request: a formal Chip GitHub review and the specialist
+coordinator's private mode-0600 attestation. The attestation binds the stable
+`OWNER/REPO#NUMBER` key, exact HEAD, per-attempt invocation ID, candidate digest, and trusted
+`PASS`/`REPAIR`/`ESCALATE` verdict, and WakeWire cross-checks it against the
+coordinator's private state. A PR-body status update is never a review artifact.
+Missing, malformed, stale, or `INCOMPLETE` evidence keeps the request held with
+a non-terminal status and retries the same canonical session. If a prior formal
+review already exists, the recovery prompt forbids submitting a duplicate.
+
+Failure mode authorizes only one limited COMMENTED review. It may inspect the
+bounded failure and enough changed code to prove a causal changed line, but may
+not read the full diff, run normal specialists, approve, or unlock itself with
+a focused rerun.
+
+One canonical parent PR session is the sole provider writer. Child agents may
+analyze read-only slices after the relevant gate, but cannot post, edit the PR
+body, resolve threads, approve, merge, or start another PR session. The parent
+revalidates child evidence against the exact HEAD before posting.
 
 ## Secrets
 

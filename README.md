@@ -76,9 +76,14 @@ This fork can also turn authenticated Slack PMs, `@Chip Byte`, `@chip`,
 `@chipbyte-snap`, explicit `@chip` email sent or copied to `chip@snapcorp.com`,
 Linear delegations, and GitHub review requests into correlated Codex Desktop
 tasks, with exact-thread Slack and Gmail final replies, ten-second delayed
-progress acknowledgments, and Makefile-owned Snap
-issue workspaces. Slack, GitHub, and Linear receive 👀 only when the exact bound
-request has not completed before the deadline.
+progress acknowledgments, and dispatcher-owned Snap ticket workspaces. System
+PR reviews publish verified workspace/status blocks in the PR body and require
+an exact-head App/Data/Snapcorp/Windmill pass before full review. Full-review
+completion also requires a formal GitHub review plus a private coordinator
+attestation binding the per-attempt invocation, specialist digest, and verdict to that exact HEAD;
+missing evidence stays visibly non-terminal and retries the same PR session.
+Slack, GitHub, and Linear receive 👀 only when the exact bound request has not
+completed before the deadline.
 Sender authorization uses enrolled immutable provider IDs for Slack, GitHub,
 and Linear. Gmail additionally requires an exact mention in the newly authored,
 unquoted body and uses an enrolled From alias plus aligned DMARC, with the

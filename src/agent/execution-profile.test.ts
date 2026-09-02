@@ -68,20 +68,19 @@ describe("parseExecutionProfile", () => {
     });
   });
 
-  it.each([
-    "Ultracode",
-    "ULTRACODE",
-    "uLtRaCoDe",
-  ])("maps the whole-word %s keyword to Sol with ultra effort", (keyword) => {
-    expect(parseExecutionProfile(`Please ${keyword} this.`)).toEqual({
-      version: 1,
-      mode: "current",
-      model: "gpt-5.6-sol",
-      reasoningEffort: "ultra",
-      source: "ultracode",
-      clarification: null,
-    });
-  });
+  it.each(["Ultracode", "ULTRACODE", "uLtRaCoDe"])(
+    "maps the whole-word %s keyword to Sol with ultra effort",
+    (keyword) => {
+      expect(parseExecutionProfile(`Please ${keyword} this.`)).toEqual({
+        version: 1,
+        mode: "current",
+        model: "gpt-5.6-sol",
+        reasoningEffort: "ultra",
+        source: "ultracode",
+        clarification: null,
+      });
+    },
+  );
 
   it("does not match Ultracode as part of a longer word", () => {
     expect(parseExecutionProfile("Please run the ultracoder check.")).toEqual(
@@ -139,16 +138,19 @@ describe("parseExecutionProfile", () => {
     ["Create a new task with Terra at max effort", "gpt-5.6-terra", "max"],
     ["open another thread using Luna light", "gpt-5.6-luna", "low"],
     ["ask for a seperate chat with Terra at high effort", "gpt-5.6-terra", "high"],
-  ] as const)("parses natural settings scoped to a separate-task request: %s", (text, model, reasoningEffort) => {
-    expect(parseExecutionProfile(text)).toEqual({
-      version: 1,
-      mode: "separate",
-      model,
-      reasoningEffort,
-      source: "explicit",
-      clarification: null,
-    });
-  });
+  ] as const)(
+    "parses natural settings scoped to a separate-task request: %s",
+    (text, model, reasoningEffort) => {
+      expect(parseExecutionProfile(text)).toEqual({
+        version: 1,
+        mode: "separate",
+        model,
+        reasoningEffort,
+        source: "explicit",
+        clarification: null,
+      });
+    },
+  );
 
   it("keeps Ultracode precedence for a natural separate-task request", () => {
     expect(
